@@ -1,0 +1,14 @@
+{
+  "name": "dsh-session-manager",
+  "version": "0.1.7",
+  "private": true,
+  "type": "module",
+  "description": "UI-only nested session folders for DSH workspaces.",
+  "exports": { ".": "./index.js", "./client": "./client.js", "./package.json": "./package.json", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md"],
+  "scripts": { "build": "node build.cjs", "test": "node --test test/*.test.cjs", "check": "node --check client.js && node --check index.js" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true, "inject": ["@deepseek-ai/dsh-client-ui-workspace"] }
+  }
+}
