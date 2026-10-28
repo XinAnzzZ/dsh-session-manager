@@ -248,9 +248,38 @@ function selectItems(selection, anchor, key, visibleKeys, { ctrl = false, shift 
   return { selection: [key], anchor: key };
 }
 
+function sessionActivity(session, statuses, sessions) {
+  const status = statuses.get(session.id);
+  const runningChildren = sessions.projectionsBySession?.[session.id]?.values.subagentCatalog?.filter(child =>
+    (statuses.get(child.id)?.running ?? sessions.byId[child.id]?.running) === true).length || 0;
+  return { runningChildren, state: status?.pendingInteraction ? 'pending'
+    : (status?.running ?? session.running) || runningChildren ? 'running' : status?.completionUnread ? 'unread' : 'idle' };
+}
+
+// Aggregate actual membership, not the expanded/paginated row projection.
+function folderActivity(state, workspaces, sessions, statuses) {
+  const folders = new Map(state.folders.map(folder => [folder.id, folder]));
+  const counts = new Map(state.folders.map(folder => [folder.id, { pending: 0, running: 0, unread: 0, idle: 0, total: 0 }]));
+  const archived = new Set(workspaces.archivedSessionIds);
+  const seen = new Set();
+  for (const workspace of workspaces.items) for (const id of workspace.sessionIds) {
+    const session = sessions.byId[id], folder = folders.get(state.sessionFolders[id]);
+    if (seen.has(id) || !session || session.origin === 'subagent' || archived.has(id) || !folder || folder.workspaceId !== workspace.workspaceId) continue;
+    seen.add(id);
+    const activity = sessionActivity(session, statuses, sessions).state;
+    let current = folder;
+    while (current) {
+      const summary = counts.get(current.id);
+      summary.total++; summary[activity]++;
+      current = folders.get(current.parentId);
+    }
+  }
+  return counts;
+}
+
 module.exports = {
   initialState, validateState, createFolder, renameFolder, setExpanded, moveItems,
-  deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems,
+  deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems, sessionActivity, folderActivity,
 };
 
 },
@@ -377,6 +406,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
   const NS = 'dsh-session-manager';
   const dictionaries = {
     zh: {
+      summary: '含子文件夹', total: '未归档会话', idle: '空闲',
       title: '会话管理', folder: '新建文件夹', session: '新建会话', rename: '重命名', remove: '删除文件夹',
       pin: '置顶', unpin: '取消置顶', archive: '归档', restore: '恢复', archived: '已归档',
       cancel: '取消', save: '保存', root: '移至工作区根目录', archiveAll: '归档会话并删除',
@@ -393,6 +423,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       treeView: '使用树状列表', viewDescription: '关闭后使用原生列表，文件夹分组数据保留。', running: '运行中', pending: '等待处理', unread: '完成未读',
     },
     en: {
+      summary: 'Includes subfolders', total: 'Unarchived sessions', idle: 'Idle',
       title: 'Session Manager', folder: 'New folder', session: 'New session', rename: 'Rename', remove: 'Delete folder',
       pin: 'Pin', unpin: 'Unpin', archive: 'Archive', restore: 'Restore', archived: 'Archived',
       cancel: 'Cancel', save: 'Save', root: 'Move sessions to workspace root', archiveAll: 'Archive sessions and delete',
@@ -415,7 +446,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
   }
   const icon = (name, props) => h(ui['Icon' + name + 'Regular'], { size: 16, ...props });
   function FolderIcon({ depth, open = true }) {
-    return h('span', { className: 'dsm-folder-icon', style: depth === undefined ? undefined : {
+    return h('span', { className: 'dsmgr-folder-icon', style: depth === undefined ? undefined : {
       color: ['var(--dsw-static-blue-400)', 'var(--dsw-static-amber-400)', 'var(--dsw-static-green-400)'][depth % 3],
     } }, icon(open ? 'FolderOpen' : 'FolderClose'));
   }
@@ -424,7 +455,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
     return h(ui.Menu, { open, onClose: () => setOpen(false), portal: true, align: 'end',
       items: items.map((item) => ({ ...item, disabled: disabled || item.disabled })),
       onSelect: (id) => { setOpen(false); items.find((item) => item.id === id)?.action(); },
-      anchor: h('button', { type: 'button', className: 'dsm-icon-button', title: label, 'aria-label': label,
+      anchor: h('button', { type: 'button', className: 'dsmgr-icon-button', title: label, 'aria-label': label,
         'aria-haspopup': 'menu', 'aria-expanded': open, disabled,
         onClick: (event) => { event.stopPropagation(); setOpen(!open); } }, icon('EllipsisOutline')) });
   }
@@ -436,15 +467,15 @@ module.exports = function createPlugin(React, model, persistence, ui) {
     const [error, setError] = React.useState('');
     return h(Dialog, { title, onClose, closeLabel: t('close'), footer: [
       h(ui.Button, { key: 'cancel', variant: 'outline', type: 'button', onClick: onClose }, t('cancel')),
-      h(ui.Button, { key: 'save', variant: 'primary', type: 'submit', form: 'dsm-name-form', disabled: !name.trim() }, t('save')),
-    ] }, h('form', { id: 'dsm-name-form', onSubmit: (event) => {
+      h(ui.Button, { key: 'save', variant: 'primary', type: 'submit', form: 'dsmgr-name-form', disabled: !name.trim() }, t('save')),
+    ] }, h('form', { id: 'dsmgr-name-form', onSubmit: (event) => {
       event.preventDefault(); if (!name.trim()) return;
       try { onSave(name.trim()); onClose(); } catch (reason) { console.error('DSH Session Manager:', reason); setError(reason.message); }
-    } }, h('input', { className: 'dsm-name-input', 'aria-label': t('name'), 'data-modal-autofocus': true,
+    } }, h('input', { className: 'dsmgr-name-input', 'aria-label': t('name'), 'data-modal-autofocus': true,
       value: name, maxLength: 120, onFocus: (event) => event.target.select(),
       onChange: (event) => { setName(event.target.value); setError(''); }, onKeyDown: (event) => {
         if (event.key === 'Enter' && (event.nativeEvent?.isComposing || event.keyCode === 229)) event.preventDefault();
-      } })), error && h('p', { className: 'dsm-name-error', role: 'alert' }, error));
+      } })), error && h('p', { className: 'dsmgr-name-error', role: 'alert' }, error));
   }
   return {
     inject: ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'locale'],
@@ -570,26 +601,38 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           window.addEventListener('storage', listener);
           return () => window.removeEventListener('storage', listener);
         }, []);
-        const button = (label, onClick, danger = false) => h(ui.Button, { key: label, variant: 'outline', type: 'button', className: danger ? 'dsm-delete-danger' : undefined, title: label, 'aria-label': label,
+        const button = (label, onClick, danger = false) => h(ui.Button, { key: label, variant: 'outline', type: 'button', className: danger ? 'dsmgr-delete-danger' : undefined, title: label, 'aria-label': label,
           disabled: busy, onClick: (event) => { event.stopPropagation(); onClick(event); } }, label);
-        const iconButton = (label, artwork, onClick, disabled = false) => h('button', { type: 'button', className: 'dsm-icon-button',
+        const iconButton = (label, artwork, onClick, disabled = false) => h('button', { type: 'button', className: 'dsmgr-icon-button',
           title: label, 'aria-label': label, disabled: disabled || busy,
           onClick: (event) => { event.stopPropagation(); onClick(event); } }, icon(artwork));
         const item = (id, label, artwork, action, disabled = false, danger = false) => ({ id, label, icon: icon(artwork), action, disabled, danger });
         const undo = () => { store.undo(); setMessage(t('undone')); };
+        const folderCounts = model.folderActivity(state, workspaces, sessions, statuses);
+        function folderSummary(id) {
+          const counts = folderCounts.get(id);
+          if (!counts || !(counts.pending || counts.running || counts.unread)) return null;
+          const summary = t('summary') + '\n' + ['pending', 'running', 'unread', 'idle', 'total'].map(key => t(key) + ': ' + counts[key]).join('\n');
+          return h(ui.HoverCard, { inline: true, content: h('div', { style: { whiteSpace: 'pre-line' } }, summary), anchor:
+            h('span', { className: 'dsmgr-folder-summary', tabIndex: 0, role: 'img', 'aria-label': summary },
+            ['pending', 'running', 'unread'].filter(key => counts[key]).map(key => h('span', {
+              key, className: 'dsmgr-folder-count', 'data-activity': key,
+            }, key === 'running' ? h(ui.StateDot, { state: 'ongoing', size: 14 })
+              : icon(key === 'pending' ? 'WarningOutline' : 'CheckCircleOutline', { size: 14 }),
+            h('span', null, counts[key])))) });
+        }
         function rowView(row) {
-          if (row.kind === 'overflow') return h('button', { key: 'overflow:' + row.id, type: 'button', className: 'dsm-overflow',
+          if (row.kind === 'overflow') return h('button', { key: 'overflow:' + row.id, type: 'button', className: 'dsmgr-overflow',
             style: { paddingLeft: 28 + row.depth * 20 }, onClick: () => setLimits((previous) => ({ ...previous,
               [row.workspaceId]: { ...previous[row.workspaceId], [row.id]: row.hidden ? row.limit + 5 : 5 },
             })) }, row.hidden ? t('showMore', { n: row.hidden }) : t('collapse'));
           const key = keyOf(row), folder = row.kind === 'folder', expanded = state.expanded['folder:' + row.id] !== false;
           const status = statuses.get(row.id);
-          const running = status?.running ?? row.running;
-          const runningChildren = sessions.projectionsBySession?.[row.id]?.values.subagentCatalog?.filter((child) =>
-            (statuses.get(child.id)?.running ?? sessions.byId[child.id]?.running) === true).length || 0;
+          const { state: activity, runningChildren } = model.sessionActivity(row, statuses, sessions);
+          const running = activity === 'running';
           const statusLabel = status?.pendingInteraction ? t('pending') + ': ' + status.pendingInteraction.kind
             : running || runningChildren ? t('running') : status?.completionUnread ? t('unread') : '';
-          return h('div', { key, role: 'treeitem', tabIndex: 0, className: 'dsm-row' + (chosen.has(key) ? ' dsm-selected' : ''),
+          return h('div', { key, role: 'treeitem', tabIndex: 0, className: 'dsmgr-row' + (chosen.has(key) ? ' dsmgr-selected' : ''),
             'data-dsm-key': key, 'aria-level': row.depth + 2, 'aria-selected': chosen.has(key),
             'aria-current': !panelActive && !folder && row.retainedBy?.mainView > 0 ? 'page' : undefined,
             'aria-expanded': folder ? expanded : undefined, draggable: !busy && !row.archived,
@@ -599,7 +642,10 @@ module.exports = function createPlugin(React, model, persistence, ui) {
               select(event, row);
               if (event.ctrlKey || event.metaKey || event.shiftKey) return;
               if (folder && event.detail < 2) safe(() => change((previous) => model.setExpanded(previous, 'folder:' + row.id, !expanded)))();
-              else if (!folder) safe(() => row.archived ? setMessage(t('restoreFirst')) : ctx.uiWorkspace.openSession(row.id))();
+              else if (!folder) {
+                if (row.archived) setMessage(t('restoreFirst'));
+                else Promise.resolve().then(() => ctx.uiWorkspace.openSession(row.id)).catch(error => { report(error); setMessage(t('failed') + ': ' + error.message); });
+              }
             },
             onDoubleClick: (event) => { event.stopPropagation(); if (!event.ctrlKey && !event.shiftKey && !event.metaKey) rename(row); },
             onDragStart: (event) => {
@@ -611,17 +657,18 @@ module.exports = function createPlugin(React, model, persistence, ui) {
             onDragOver: folder ? (event) => { if (dragging) { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; } } : undefined,
             onDrop: folder ? (event) => drop(event, row.workspaceId, row.id) : undefined,
           }, folder ? h(FolderIcon, { depth: row.depth, open: expanded }) : h('span', {
-            className: 'dsm-status ' + (status?.pendingInteraction ? 'dsm-pending' : statusLabel ? 'dsm-running' : ''),
+            className: 'dsmgr-status ' + (status?.pendingInteraction ? 'dsmgr-pending' : statusLabel ? 'dsmgr-running' : ''),
             title: statusLabel, 'aria-label': statusLabel || undefined }, !row.archived && statusLabel && h(ui.StateDot, {
               state: status?.pendingInteraction ? 'warning' : running || runningChildren ? 'ongoing' : 'done',
             })),
           !folder && runningChildren > 0 && h('small', { title: t('running'), 'aria-label': t('running') + ': ' + runningChildren }, '+' + runningChildren),
-          h('span', { className: 'dsm-label', title: row.name || row.displayTitle || row.title }, folder ? row.name : row.displayTitle || row.title || t('session')),
-          !folder && !row.blank && h('span', { className: 'dsm-time' }, (() => {
+          h('span', { className: 'dsmgr-label', title: row.name || row.displayTitle || row.title }, folder ? row.name : row.displayTitle || row.title || t('session')),
+          folder && folderSummary(row.id),
+          !folder && !row.blank && h('span', { className: 'dsmgr-time' }, (() => {
             const { unit, n } = ui.relativeTime(row.updatedAt, Date.now()); return t('time.' + unit, { n });
           })()),
-          !folder && !row.archived && pinned.has(row.id) && h('span', { className: 'dsm-pin', 'aria-label': t('pin'), title: t('pin') }, icon('PinFill', { size: 14 })),
-          h('span', { className: 'dsm-actions', onClick: (event) => event.stopPropagation(), onDoubleClick: (event) => event.stopPropagation(), draggable: false,
+          !folder && !row.archived && pinned.has(row.id) && h('span', { className: 'dsmgr-pin', 'aria-label': t('pin'), title: t('pin') }, icon('PinFill', { size: 14 })),
+          h('span', { className: 'dsmgr-actions', onClick: (event) => event.stopPropagation(), onDoubleClick: (event) => event.stopPropagation(), draggable: false,
             onDragStart: (event) => event.preventDefault() },
           h(Actions, { label: t('more'), disabled: busy, items: folder ? [
             item('folder', t('folder'), 'FolderClose', () => setDialog({ type: 'create', workspaceId: row.workspaceId, parentId: row.id })),
@@ -666,10 +713,10 @@ module.exports = function createPlugin(React, model, persistence, ui) {
             event.preventDefault(); safe(() => change((previous) => model.setExpanded(previous, 'folder:' + row.id, event.key === 'ArrowRight')))();
           }
         }
-        if (!wide) return h('button', { type: 'button', className: 'dsm-expand', title: t('title'), onClick: expandSidebar }, h(FolderIcon, {}));
-        return h('section', { className: 'dsm', ref: rootRef, onKeyDown: keyboard, 'aria-label': t('title') },
-          h('style', null, styles), h('header', null, !searchOpen && h('span', { className: 'dsm-heading' }, t('workspace')),
-            searchOpen ? h('div', { className: 'dsm-search' }, icon('SearchOutline'),
+        if (!wide) return h('button', { type: 'button', className: 'dsmgr-expand', title: t('title'), onClick: expandSidebar }, h(FolderIcon, {}));
+        return h('section', { className: 'dsmgr', ref: rootRef, onKeyDown: keyboard, 'aria-label': t('title') },
+          h('style', null, styles), h('header', null, !searchOpen && h('span', { className: 'dsmgr-heading' }, t('workspace')),
+            searchOpen ? h('div', { className: 'dsmgr-search' }, icon('SearchOutline'),
               h('input', { ref: searchRef, type: 'text', value: query, maxLength: 500, 'aria-label': t('search'), placeholder: t('search'),
                 onChange: (event) => { const value = event.target.value.replaceAll('\0', '');
                   setQuery(Array.from(value).reduce((text, char) => text.length + char.length <= 500 ? text + char : text, '')); },
@@ -680,36 +727,36 @@ module.exports = function createPlugin(React, model, persistence, ui) {
             h(Actions, { label: t('more'), disabled: busy, items: [
               item('archived', t(showArchived ? 'hideArchived' : 'archived'), 'ArchiveOutline', () => setShowArchived((shown) => !shown)),
             ] })), 
-          h('div', { className: 'dsm-tree', role: 'tree', 'aria-label': t('title'), 'aria-multiselectable': true },
+          h('div', { className: 'dsmgr-tree', role: 'tree', 'aria-label': t('title'), 'aria-multiselectable': true },
             (sessions.phase !== 'ready' || workspaces.phase !== 'ready') && h('p', null, t('loading')),
-            q ? h('div', { className: 'dsm-search-results' }, [...matches.values()].slice(0, 20).map((row) => h('div', { key: row.id },
-              rowView(row), h('div', { className: 'dsm-search-meta' }, row.workspaceTitle,
+            q ? h('div', { className: 'dsmgr-search-results' }, [...matches.values()].slice(0, 20).map((row) => h('div', { key: row.id },
+              rowView(row), h('div', { className: 'dsmgr-search-meta' }, row.workspaceTitle,
                 row.snippet && h('span', null, row.snippet)))),
-              remote.query === q && remote.loading && h('p', { role: 'status', className: 'dsm-hint' }, t('loading')),
-              !matches.size && !(remote.query === q && remote.loading) && h('p', { className: 'dsm-hint' }, t('noMatches')),
-              (matches.size > 20 || remote.query === q && remote.hasMore) && h('p', { className: 'dsm-hint' }, t('refineSearch')))
+              remote.query === q && remote.loading && h('p', { role: 'status', className: 'dsmgr-hint' }, t('loading')),
+              !matches.size && !(remote.query === q && remote.loading) && h('p', { className: 'dsmgr-hint' }, t('noMatches')),
+              (matches.size > 20 || remote.query === q && remote.hasMore) && h('p', { className: 'dsmgr-hint' }, t('refineSearch')))
               : groupsWithRows.filter((group) => group.workspaceId || group.rows.length).map((group) => {
               const open = state.expanded[workspaceKey(group.workspaceId)] !== false;
               return h('div', { key: group.workspaceId }, h('div', { role: 'treeitem', 'aria-level': 1, 'aria-expanded': open,
-                tabIndex: 0, className: 'dsm-row dsm-workspace', title: group.path,
+                tabIndex: 0, className: 'dsmgr-row dsmgr-workspace', title: group.path,
                 onClick: safe(() => change((previous) => model.setExpanded(previous, workspaceKey(group.workspaceId), !open))),
                 onDragOver: (event) => { if (dragging) event.preventDefault(); }, onDrop: (event) => drop(event, group.workspaceId, null) },
               h(FolderIcon, { open }),
-              h('span', { className: 'dsm-label' }, group.title || group.path?.split(/[\\/]/).filter(Boolean).at(-1) || t('workspace')),
-              group.workspaceId && h('span', { className: 'dsm-actions' },
+              h('span', { className: 'dsmgr-label' }, group.title || group.path?.split(/[\\/]/).filter(Boolean).at(-1) || t('workspace')),
+              group.workspaceId && h('span', { className: 'dsmgr-actions' },
                 h(Actions, { label: t('more'), disabled: busy, items: [
                   item('folder', t('folder'), 'FolderClose', () => setDialog({ type: 'create', workspaceId: group.workspaceId, parentId: null })),
                   item('session', t('session'), 'NewChatOutline', safe(() => newSession(group.workspaceId, null))),
                 ] }), iconButton(t('session'), 'NewChatOutline', safe(() => newSession(group.workspaceId, null))))),
-              open && group.rows.map(rowView), open && group.rows.length === 0 && h('p', { className: 'dsm-hint' }, t('empty')));
+              open && group.rows.map(rowView), open && group.rows.length === 0 && h('p', { className: 'dsmgr-hint' }, t('empty')));
             })),
-          message && h('p', { role: 'status', 'aria-live': 'polite', className: 'dsm-message' }, message),
+          message && h('p', { role: 'status', 'aria-live': 'polite', className: 'dsmgr-message' }, message),
           dialog && (dialog.type === 'delete' ? h(Dialog, { title: t('remove'), closeLabel: t('close'), onClose: () => !busy && setDialog(null), footer:
-            h('div', { className: 'dsm-delete-actions' },
+            h('div', { className: 'dsmgr-delete-actions' },
               button(t('root'), safe(() => removeFolder(false))),
               button(t('archiveAll'), safe(() => removeFolder(true)), true),
               button(t('cancel'), () => setDialog(null)))
-          }, h('p', { className: 'dsm-delete-message' }, t('deleteMessage')), busy && h('p', null, t('loading')))
+          }, h('p', { className: 'dsmgr-delete-message' }, t('deleteMessage')), busy && h('p', null, t('loading')))
             : h(NameDialog, { key: dialog.type + (dialog.row?.id || ''), title: t(dialog.type === 'create' ? 'folder' : 'rename'),
               initial: dialog.row?.name, t, onClose: () => setDialog(null), onSave: (name) => change((previous) => dialog.type === 'create'
                 ? model.createFolder(previous, { id: crypto.randomUUID(), workspaceId: dialog.workspaceId, parentId: dialog.parentId, name })
@@ -774,23 +821,25 @@ module.exports = function createPlugin(React, model, persistence, ui) {
 };
 
 const styles = `
-.dsm{display:flex;flex-direction:column;min-height:0;font:inherit;color:var(--dsw-alias-label-primary);height:100%;padding-right:var(--dsh-sidebar-inline-padding,8px);box-sizing:border-box}
-.dsm header{display:flex;align-items:center;gap:4px;height:36px;min-height:36px;margin:2px -4px 4px 0;padding-left:4px;color:var(--dsw-alias-label-tertiary)}.dsm-heading{flex:1;font-weight:400}.dsm button,.dsm-dialog button{font:inherit;cursor:pointer}.dsm-tree{min-height:0;overflow:auto;flex:1}.dsm-row{box-sizing:border-box;display:flex;align-items:center;gap:6px;height:32px;padding:0 8px;border-radius:var(--dsw-radius-md);cursor:pointer;user-select:none;color:var(--dsw-alias-label-primary);flex-shrink:0}
-.dsm-row:hover,.dsm-row[aria-current=page]{background:var(--dsw-alias-interactive-bg-hover)}.dsm-selected[aria-selected=true]{background:var(--dsw-alias-interactive-bg-hover)}
-.dsm-workspace,.dsm-row[data-kind=folder]{height:34px}.dsm-workspace{margin-top:8px}.dsm-label{font-size:14px;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
-.dsm-row[data-kind=session]{gap:0}.dsm-row[data-kind=session]>.dsm-label{margin:0 6px 0 4px}.dsm-status,.dsm-folder-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:20px;flex:none;color:var(--dsw-alias-label-tertiary)}
-.dsm-time{font-size:10px;line-height:16px;flex:none;color:var(--dsw-alias-label-tertiary)}.dsm-pin{display:inline-flex;align-items:center;justify-content:center;width:16px;height:20px;margin-left:6px;flex:none;color:var(--dsw-alias-label-caption)}
-.dsm-actions{display:none;align-items:center;gap:15px;flex:none}.dsm-row:hover>.dsm-actions,.dsm-row:focus-within>.dsm-actions,.dsm-actions:has([aria-expanded=true]){display:inline-flex}.dsm-row:hover>.dsm-time,.dsm-row:hover>.dsm-pin,.dsm-row:focus-within>.dsm-time,.dsm-row:focus-within>.dsm-pin{display:none}
-.dsm-icon-button{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;flex:none;padding:0;border:0;border-radius:var(--dsw-radius-xs);background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}.dsm header .dsm-icon-button{width:28px;height:28px}.dsm-icon-button:hover{color:var(--dsw-alias-label-primary)}.dsm header .dsm-icon-button:hover{background:var(--dsw-alias-interactive-bg-hover)}
-.dsm button:disabled,.dsm-dialog button:disabled{opacity:.4;cursor:default}.dsm button:focus-visible,.dsm-row:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-2px}
-.dsm-overflow{display:block;text-align:left;font-size:12px!important;line-height:20px;color:var(--dsw-alias-label-tertiary);background:transparent;border:0;padding:4px 8px}.dsm-overflow:hover{color:var(--dsw-alias-label-primary)}.dsm-hint,.dsm-message{font-size:12px;padding:2px 10px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}.dsm-message{white-space:pre-wrap}
-.dsm-name-input{box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l4);border-radius:var(--dsw-radius-lg);width:100%;height:44px;color:var(--dsw-alias-label-primary);background:transparent;outline:none;padding:7px 14px;font-family:var(--dsw-font-family);font-size:14px;font-weight:400;line-height:22px}
-.dsm-delete-actions{display:flex;flex-direction:column;gap:8px;width:100%;min-width:0}.dsm-delete-actions>button{width:100%;flex-shrink:0;white-space:nowrap;font:inherit;font-size:14px;line-height:22px}.dsm-delete-actions>.dsm-delete-danger{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}.dsm-delete-message{margin:0;font-size:14px;line-height:22px;overflow-wrap:anywhere}
-.dsm-name-error{color:var(--dsw-alias-state-error-primary);margin-top:8px;font-size:12px;line-height:18px}
-.dsm-row[data-archived=true]>.dsm-label{color:var(--dsw-alias-label-caption)}
-.dsm-search{display:flex;align-items:center;gap:4px;min-width:0;flex:1;color:var(--dsw-alias-label-secondary)}.dsm-search input{font:inherit;color:var(--dsw-alias-label-primary);background:transparent;border:0;outline:none;min-width:0;width:100%}.dsm-search:focus-within{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));border-radius:var(--dsw-radius-sm)}
-.dsm-search-meta{display:flex;gap:6px;margin:0 8px 4px 28px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-tertiary)}.dsm-search-meta span{color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dsm-expand{background:transparent;border:0;color:inherit;cursor:pointer;padding:12px}
+.dsmgr{display:flex;flex-direction:column;min-height:0;font:inherit;color:var(--dsw-alias-label-primary);height:100%;padding-right:var(--dsh-sidebar-inline-padding,8px);box-sizing:border-box}
+.dsmgr header{display:flex;align-items:center;gap:4px;height:36px;min-height:36px;margin:2px -4px 4px 0;padding-left:4px;color:var(--dsw-alias-label-tertiary)}.dsmgr-heading{flex:1;font-weight:400}.dsmgr button,.dsmgr-dialog button{font:inherit;cursor:pointer}.dsmgr-tree{min-height:0;overflow:auto;flex:1}.dsmgr-row{box-sizing:border-box;display:flex;align-items:center;gap:6px;height:32px;padding:0 8px;border-radius:var(--dsw-radius-md);cursor:pointer;user-select:none;color:var(--dsw-alias-label-primary);flex-shrink:0}
+.dsmgr-row:hover,.dsmgr-row[aria-current=page]{background:var(--dsw-alias-interactive-bg-hover)}.dsmgr-selected[aria-selected=true]{background:var(--dsw-alias-interactive-bg-hover)}
+.dsmgr-workspace,.dsmgr-row[data-kind=folder]{height:34px}.dsmgr-workspace{margin-top:8px}.dsmgr-label{font-size:14px;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.dsmgr-row[data-kind=session]{gap:0}.dsmgr-row[data-kind=session]>.dsmgr-label{margin:0 6px 0 4px}.dsmgr-status,.dsmgr-folder-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:20px;flex:none;color:var(--dsw-alias-label-tertiary)}
+.dsmgr-folder-summary{display:inline-flex;gap:8px;flex:none;font-size:12px;line-height:20px;color:var(--dsw-alias-label-secondary)}.dsmgr-folder-count{display:inline-flex;align-items:center;gap:4px}.dsmgr-folder-count[data-activity=pending]>svg{color:var(--dsw-alias-state-warn-primary)}.dsmgr-folder-count[data-activity=unread]>svg{color:var(--dsw-alias-state-success-primary)}
+.dsmgr-row[data-kind=folder]{width:100%;container-type:inline-size}@container(max-width:260px){.dsmgr-folder-count~.dsmgr-folder-count{display:none}}
+.dsmgr-time{font-size:10px;line-height:16px;flex:none;color:var(--dsw-alias-label-tertiary)}.dsmgr-pin{display:inline-flex;align-items:center;justify-content:center;width:16px;height:20px;margin-left:6px;flex:none;color:var(--dsw-alias-label-caption)}
+.dsmgr-actions{display:none;align-items:center;gap:15px;flex:none}.dsmgr-row:hover>.dsmgr-actions,.dsmgr-row:focus-within>.dsmgr-actions,.dsmgr-actions:has([aria-expanded=true]){display:inline-flex}.dsmgr-row:hover>.dsmgr-time,.dsmgr-row:hover>.dsmgr-pin,.dsmgr-row:focus-within>.dsmgr-time,.dsmgr-row:focus-within>.dsmgr-pin{display:none}
+.dsmgr-icon-button{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;flex:none;padding:0;border:0;border-radius:var(--dsw-radius-xs);background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}.dsmgr header .dsmgr-icon-button{width:28px;height:28px}.dsmgr-icon-button:hover{color:var(--dsw-alias-label-primary)}.dsmgr header .dsmgr-icon-button:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsmgr button:disabled,.dsmgr-dialog button:disabled{opacity:.4;cursor:default}.dsmgr button:focus-visible,.dsmgr-row:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-2px}
+.dsmgr-overflow{display:block;text-align:left;font-size:12px!important;line-height:20px;color:var(--dsw-alias-label-tertiary);background:transparent;border:0;padding:4px 8px}.dsmgr-overflow:hover{color:var(--dsw-alias-label-primary)}.dsmgr-hint,.dsmgr-message{font-size:12px;padding:2px 10px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}.dsmgr-message{white-space:pre-wrap}
+.dsmgr-name-input{box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l4);border-radius:var(--dsw-radius-lg);width:100%;height:44px;color:var(--dsw-alias-label-primary);background:transparent;outline:none;padding:7px 14px;font-family:var(--dsw-font-family);font-size:14px;font-weight:400;line-height:22px}
+.dsmgr-delete-actions{display:flex;flex-direction:column;gap:8px;width:100%;min-width:0}.dsmgr-delete-actions>button{width:100%;flex-shrink:0;white-space:nowrap;font:inherit;font-size:14px;line-height:22px}.dsmgr-delete-actions>.dsmgr-delete-danger{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}.dsmgr-delete-message{margin:0;font-size:14px;line-height:22px;overflow-wrap:anywhere}
+.dsmgr-name-error{color:var(--dsw-alias-state-error-primary);margin-top:8px;font-size:12px;line-height:18px}
+.dsmgr-row[data-archived=true]>.dsmgr-label{color:var(--dsw-alias-label-caption)}
+.dsmgr-search{display:flex;align-items:center;gap:4px;min-width:0;flex:1;color:var(--dsw-alias-label-secondary)}.dsmgr-search input{font:inherit;color:var(--dsw-alias-label-primary);background:transparent;border:0;outline:none;min-width:0;width:100%}.dsmgr-search:focus-within{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));border-radius:var(--dsw-radius-sm)}
+.dsmgr-search-meta{display:flex;gap:6px;margin:0 8px 4px 28px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-tertiary)}.dsmgr-search-meta span{color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsmgr-expand{background:transparent;border:0;color:inherit;cursor:pointer;padding:12px}
 `;
 
 }};

@@ -243,7 +243,36 @@ function selectItems(selection, anchor, key, visibleKeys, { ctrl = false, shift 
   return { selection: [key], anchor: key };
 }
 
+function sessionActivity(session, statuses, sessions) {
+  const status = statuses.get(session.id);
+  const runningChildren = sessions.projectionsBySession?.[session.id]?.values.subagentCatalog?.filter(child =>
+    (statuses.get(child.id)?.running ?? sessions.byId[child.id]?.running) === true).length || 0;
+  return { runningChildren, state: status?.pendingInteraction ? 'pending'
+    : (status?.running ?? session.running) || runningChildren ? 'running' : status?.completionUnread ? 'unread' : 'idle' };
+}
+
+// Aggregate actual membership, not the expanded/paginated row projection.
+function folderActivity(state, workspaces, sessions, statuses) {
+  const folders = new Map(state.folders.map(folder => [folder.id, folder]));
+  const counts = new Map(state.folders.map(folder => [folder.id, { pending: 0, running: 0, unread: 0, idle: 0, total: 0 }]));
+  const archived = new Set(workspaces.archivedSessionIds);
+  const seen = new Set();
+  for (const workspace of workspaces.items) for (const id of workspace.sessionIds) {
+    const session = sessions.byId[id], folder = folders.get(state.sessionFolders[id]);
+    if (seen.has(id) || !session || session.origin === 'subagent' || archived.has(id) || !folder || folder.workspaceId !== workspace.workspaceId) continue;
+    seen.add(id);
+    const activity = sessionActivity(session, statuses, sessions).state;
+    let current = folder;
+    while (current) {
+      const summary = counts.get(current.id);
+      summary.total++; summary[activity]++;
+      current = folders.get(current.parentId);
+    }
+  }
+  return counts;
+}
+
 module.exports = {
   initialState, validateState, createFolder, renameFolder, setExpanded, moveItems,
-  deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems,
+  deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems, sessionActivity, folderActivity,
 };

@@ -179,6 +179,7 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
     Modal: props => view.React.createElement('native-modal', props, props.children, props.footer),
     Button: props => view.React.createElement('button', props, props.children),
     Menu: props => view.React.createElement('native-menu', props, props.anchor),
+    HoverCard: props => view.React.createElement('native-hovercard', props, props.anchor),
     StateDot: props => view.React.createElement('native-state-dot', props),
     Switch: props => view.React.createElement('native-switch', props),
     relativeTime: () => ({ unit: 'minutes', n: 1 }),
@@ -199,6 +200,29 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
   return { plugin, ctx, slots, entries, native, archive, calls, errors, warnings, storage, subscriptions, sessions, workspaces,
     windowListeners, render, click, emit, cleanup, renderToggle: () => nodes(view.render(entries.get('settings.section')[0].component, {}), node => node.type === 'native-switch')[0], get tree() { return tree; } };
 }
+
+test('folder summary uses native icons, hides zero groups, and updates while collapsed without storage writes', t => {
+  const state = { ...fixtureState(), sessionFolders: { s1: 'a', s2: 'a', archived: 'a' }, expanded: { 'folder:a': false } };
+  const app = setup(t, { state });
+  const statuses = new Map([['s1', { pendingInteraction: { kind: 'approval' }, running: true }], ['s2', { completionUnread: true }], ['archived', { running: true }]]);
+  const render = () => app.render({ useSessionStatus: selector => selector(statuses) });
+  let tree = render();
+  let folder = row(tree, 'folder:a');
+  assert.equal(folder.props['aria-expanded'], false);
+  assert.equal(nodes(folder, n => n.props['data-activity'] === 'pending').length, 1);
+  assert.equal(nodes(folder, n => n.props['data-activity'] === 'running').length, 0);
+  assert.equal(nodes(folder, n => n.props['data-activity'] === 'unread').length, 1);
+  assert.ok(nodes(folder, n => n.props.name === 'IconWarningOutlineRegular').length);
+  assert.ok(nodes(folder, n => n.props.name === 'IconCheckCircleOutlineRegular').length);
+  assert.match(nodes(folder, n => n.props.role === 'img')[0].props['aria-label'], /Includes subfolders[\s\S]*Unarchived sessions: 2/);
+  statuses.set('s1', { running: true });
+  folder = row(render(), 'folder:a');
+  assert.ok(nodes(folder, n => n.type === 'native-state-dot' && n.props.state === 'ongoing' && n.props.size === 14).length);
+  statuses.clear();
+  folder = row(render(), 'folder:a');
+  assert.equal(nodes(folder, n => n.props.className === 'dsmgr-folder-summary').length, 0);
+  assert.equal(app.storage.writes, 0);
+});
 
 test('factory declares dependencies and apply shadows native using options metadata, then cleans up', t => {
   const app = setup(t);
@@ -266,6 +290,33 @@ test('session opening, raw-title double-click rename, pin and native archive del
   assert.equal(app.storage.writes, 0);
 });
 
+test('folder and session titles expose their complete text as the native title hint', t => {
+  const tree = setup(t).render();
+  for (const [key, label] of [['folder:a', 'Alpha'], ['session:s1', 'First']])
+    assert.equal(nodes(row(tree, key), n => n.props.className === 'dsmgr-label')[0].props.title, label);
+});
+
+test('session navigation remains available while another sidebar action is pending', async t => {
+  const app = setup(t);
+  let finish;
+  app.ctx.uiWorkspace.pinSession = () => new Promise(resolve => { finish = resolve; });
+  await app.click(button(row(app.render(), 'session:s1'), 'Pin'));
+  await app.click(row(app.render(), 'session:s2'));
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's2']);
+  finish();
+  await flush();
+});
+
+test('session navigation failures are visible without blocking the next click', async t => {
+  const app = setup(t);
+  app.ctx.uiWorkspace.openSession = () => Promise.reject(new Error('navigation failed'));
+  await app.click(row(app.render(), 'session:s1'));
+  assert.match(text(app.render()), /Operation failed: navigation failed/);
+  app.ctx.uiWorkspace.openSession = id => app.calls.push(['openSession', id]);
+  await app.click(row(app.render(), 'session:s2'));
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's2']);
+});
+
 test('archived list restores through uiWorkspace without opening or regrouping', async t => {
   const app = setup(t);
   let tree = app.render();
@@ -279,7 +330,7 @@ test('archived list restores through uiWorkspace without opening or regrouping',
   assert.equal(nodes(tree, node => node.type === 'native-modal').length, 0);
   await app.click(button(tree, 'Hide archived'));
   tree = app.render();
-  assert.equal(nodes(tree, node => node.props.className === 'dsm-archived-list').length, 0);
+  assert.equal(nodes(tree, node => node.props.className === 'dsmgr-archived-list').length, 0);
 });
 
 test('new session creates fresh identity and persists folder before native navigation', async t => {
@@ -345,7 +396,7 @@ test('folder move rejects descendant cycle without persistence change', t => {
 test('folder creation and rename dialog save through model and storage', async t => {
   const app = setup(t);
   let tree = app.render();
-  const workspace = nodes(tree, node => node.props.className === 'dsm-row dsm-workspace')[0];
+  const workspace = nodes(tree, node => node.props.className === 'dsmgr-row dsmgr-workspace')[0];
   await app.click(button(workspace, 'New folder'));
   tree = app.render();
   let input = nodes(tree, node => node.type === 'input')[0];
@@ -426,7 +477,7 @@ test('corrupt storage event reports error and keeps rendered last-valid folders'
 test('ungrouped workspace can collapse with a valid persisted empty-id key', async t => {
   const app = setup(t);
   let tree = app.render();
-  const ungrouped = nodes(tree, node => node.props.className === 'dsm-row dsm-workspace').find(node => text(node).includes('Ungrouped'));
+  const ungrouped = nodes(tree, node => node.props.className === 'dsmgr-row dsmgr-workspace').find(node => text(node).includes('Ungrouped'));
   assert.ok(ungrouped);
   await app.click(ungrouped);
   tree = app.render();
@@ -447,7 +498,7 @@ test('current-session marker follows mainView retention and active native panel'
 test('running state comes from native status selector, overriding stale list summary', t => {
   const app = setup(t);
   const tree = app.render({ useSessionStatus: selector => selector(new Map([['s1', { running: true }]])) });
-  assert.equal(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsm-status dsm-running').length, 1);
+  assert.equal(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-status dsmgr-running').length, 1);
 });
 
 test('archive rejection keeps folder assignments and dialog available', async t => {
@@ -648,7 +699,7 @@ test('pending interaction wins over running and unread status presentation', t =
   const tree = app.render({ useSessionStatus: selector => selector(new Map([['s1', {
     pendingInteraction: { kind: 'approval' }, running: true, completionUnread: true,
   }]])) });
-  const indicator = nodes(row(tree, 'session:s1'), node => node.props.className === 'dsm-status dsm-pending')[0];
+  const indicator = nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-status dsmgr-pending')[0];
   assert.ok(indicator);
   assert.equal(indicator.props['aria-label'], 'Needs attention: approval');
   assert.equal(nodes(indicator, node => node.type === 'native-state-dot')[0].props.state, 'warning');
@@ -715,18 +766,18 @@ test('native UI primitives replace glyphs, use themed 14px rows and contain icon
   assert.ok(nodes(row(tree, 'session:s2'), node => node.type === 'native-icon' && node.props.name === 'IconPinFillRegular').length);
   const css = text(nodes(tree, node => node.type === 'style')[0]);
   assert.match(css, /font:inherit/);
-  assert.match(css, /data-archived=true\]>\.dsm-label\{color:var\(--dsw-alias-label-caption\)/);
+  assert.match(css, /data-archived=true\]>\.dsmgr-label\{color:var\(--dsw-alias-label-caption\)/);
   assert.match(css, /--dsw-alias-label-primary/);
   assert.doesNotMatch(text(tree), /Ctrl-click select|Shift-click range/);
   assert.equal(text(button(row(tree, 'folder:a'), 'New session')), '');
-  assert.equal(text(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsm-time')[0]), '1m');
+  assert.equal(text(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-time')[0]), '1m');
 });
 
 test('nested folder colors differ and native menu exposes new, rename and delete actions', t => {
   const state = model.createFolder(fixtureState(), { id: 'child', parentId: 'a', workspaceId: 'w', name: 'Child' });
   const app = setup(t, { state });
   const tree = app.render();
-  const color = key => nodes(row(tree, key), node => node.props.className === 'dsm-folder-icon')[0].props.style.color;
+  const color = key => nodes(row(tree, key), node => node.props.className === 'dsmgr-folder-icon')[0].props.style.color;
   assert.notEqual(color('folder:a'), color('folder:child'));
   const menus = nodes(row(tree, 'folder:a'), node => node.type === 'native-menu');
   assert.deepEqual(menus[0].props.items.map(item => item.id), ['folder', 'session', 'rename', 'delete']);
@@ -746,8 +797,8 @@ test('archived toggle mixes gray rows into normal ordering and folder, without a
   assert.equal(archived.props.style.paddingLeft, row(tree, 'session:s1').props.style.paddingLeft);
   const order = nodes(tree, node => node.props['data-dsm-key']).map(node => node.props['data-dsm-key']);
   assert.ok(order.indexOf('session:archived') < order.indexOf('session:s1'));
-  assert.equal(nodes(archived, node => node.props.className === 'dsm-pin').length, 0);
-  assert.equal(nodes(tree, node => node.props.className === 'dsm-archived-list').length, 0);
+  assert.equal(nodes(archived, node => node.props.className === 'dsmgr-pin').length, 0);
+  assert.equal(nodes(tree, node => node.props.className === 'dsmgr-archived-list').length, 0);
   await app.click(archived);
   assert.equal(app.calls.some(call => call[0] === 'openSession'), false);
   assert.match(text(app.render()), /Restore this archived session/);
@@ -770,7 +821,7 @@ test('rendered pagination grows by five and shift selection excludes hidden sess
   const extras = () => nodes(tree, node => node.props['data-dsm-key']?.startsWith('session:extra')).length;
   assert.equal(extras(), 4); // The pinned s2 takes the first seat; blank does not consume one.
   assert.equal(nodes(tree, node => node.type === 'native-menu').flatMap(node => node.props.items).some(item => item.id === 'undo'), false);
-  const more = nodes(tree, node => node.props.className === 'dsm-overflow')[0];
+  const more = nodes(tree, node => node.props.className === 'dsmgr-overflow')[0];
   await app.click(more);
   tree = app.render();
   assert.equal(extras(), 9);
