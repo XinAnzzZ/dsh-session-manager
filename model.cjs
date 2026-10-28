@@ -251,28 +251,39 @@ function sessionActivity(session, statuses, sessions) {
     : (status?.running ?? session.running) || runningChildren ? 'running' : status?.completionUnread ? 'unread' : 'idle' };
 }
 
-// Aggregate actual membership, not the expanded/paginated row projection.
-function folderActivity(state, workspaces, sessions, statuses) {
-  const folders = new Map(state.folders.map(folder => [folder.id, folder]));
-  const counts = new Map(state.folders.map(folder => [folder.id, { pending: 0, running: 0, unread: 0, idle: 0, total: 0 }]));
+// Folders holding a session inside its workspace, innermost first.
+function folderChain(state, id, workspaceId) {
+  const folderById = new Map(state.folders.map(folder => [folder.id, folder]));
+  const chain = [];
+  for (let folder = folderById.get(state.sessionFolders[id]); folder?.workspaceId === workspaceId; folder = folderById.get(folder.parentId)) chain.push(folder);
+  return chain;
+}
+
+// Aggregate actual membership, not the expanded/paginated row projection. Sessions outside every
+// workspace form the '' (ungrouped) workspace, matching the tree; the total covers all workspaces.
+// ids lists the non-idle sessions behind each count so the summary can jump to them.
+function treeActivity(state, workspaces, sessions, statuses) {
+  const empty = () => ({ pending: 0, running: 0, unread: 0, idle: 0, total: 0, ids: { pending: [], running: [], unread: [] } });
+  const result = { folders: new Map(state.folders.map(folder => [folder.id, empty()])), workspaces: new Map(), total: empty() };
   const archived = new Set(workspaces.archivedSessionIds);
   const seen = new Set();
-  for (const workspace of workspaces.items) for (const id of workspace.sessionIds) {
-    const session = sessions.byId[id], folder = folders.get(state.sessionFolders[id]);
-    if (seen.has(id) || !session || session.origin === 'subagent' || archived.has(id) || !folder || folder.workspaceId !== workspace.workspaceId) continue;
-    seen.add(id);
-    const activity = sessionActivity(session, statuses, sessions).state;
-    let current = folder;
-    while (current) {
-      const summary = counts.get(current.id);
-      summary.total++; summary[activity]++;
-      current = folders.get(current.parentId);
+  for (const { workspaceId, sessionIds } of [...workspaces.items, { workspaceId: '', sessionIds: sessions.ids || [] }]) {
+    const workspace = empty();
+    result.workspaces.set(workspaceId, workspace);
+    for (const id of sessionIds) {
+      const session = sessions.byId[id];
+      if (seen.has(id) || !session || session.blank || session.origin === 'subagent' || archived.has(id)) continue;
+      seen.add(id);
+      const activity = sessionActivity(session, statuses, sessions).state;
+      const add = summary => { summary.total++; summary[activity]++; summary.ids[activity]?.push(id); };
+      add(result.total); add(workspace);
+      for (const folder of folderChain(state, id, workspaceId)) add(result.folders.get(folder.id));
     }
   }
-  return counts;
+  return result;
 }
 
 module.exports = {
   initialState, validateState, createFolder, renameFolder, setExpanded, moveItems,
-  deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems, sessionActivity, folderActivity,
+  deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems, sessionActivity, treeActivity, folderChain,
 };

@@ -60,7 +60,7 @@ function renderer() {
     }
     const host = { ...node, children: resolve(node.children, path + '.children') };
     host.props.ref && (host.props.ref.current = {
-      showModal() {}, close() {}, focus() {}, querySelectorAll() { return []; },
+      showModal() {}, close() {}, focus() {}, querySelectorAll() { return []; }, querySelector() { return null; },
     });
     return [host];
   }
@@ -84,12 +84,18 @@ function nodes(root, predicate) {
 }
 const text = node => typeof node === 'object' && node ? node.children.map(text).join('') : String(node ?? '');
 function button(root, label) {
-  const match = nodes(root, node => node.type === 'button' && node.props['aria-label'] === label)[0];
+  const match = nodes(root, node => node.type === 'button' && (node.props['aria-label'] ?? text(node)) === label)[0];
   if (match) return match;
   const menu = nodes(root, node => node.type === 'native-menu' && node.props.items.some(item => item.label === label))[0];
   assert.ok(menu, `Expected button or native menu item ${label}`);
   const item = menu.props.items.find(item => item.label === label);
   return { props: { disabled: item.disabled, onClick: () => menu.props.onSelect(item.id) } };
+}
+// Delete dialog: optional "also archive" checkbox, then the single danger Delete button.
+async function confirmDelete(app, archive) {
+  let tree = app.render();
+  if (archive) { nodes(tree, node => node.type === 'native-checkbox')[0].props.onChange(true); tree = app.render(); }
+  await app.click(nodes(tree, node => node.type === 'button' && text(node) === 'Delete')[0]);
 }
 function row(root, key) {
   const match = nodes(root, node => node.props['data-dsm-key'] === key)[0];
@@ -116,8 +122,11 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
   const errors = [], warnings = [], calls = [], effects = [], windowListeners = new Map();
   console.error = (...args) => errors.push(args);
   console.warn = (...args) => warnings.push(args);
-  const storage = { raw, writes: 0, mode, getItem: key => key === KEY ? storage.raw : storage.mode,
-    setItem(key, value) { if (key !== KEY) { storage.mode = value; return; } storage.raw = value; storage.writes++; } };
+  const MODE = 'dsh.session-manager.tree-view';
+  const storage = { raw, writes: 0, mode, other: {},
+    getItem: key => key === KEY ? storage.raw : key === MODE ? storage.mode : storage.other[key] ?? null,
+    setItem(key, value) { if (key === MODE) { storage.mode = value; return; } if (key !== KEY) { storage.other[key] = value; return; } storage.raw = value; storage.writes++; },
+    removeItem(key) { delete storage.other[key]; } };
   global.window = { localStorage: storage,
     addEventListener(name, callback) { if (!windowListeners.has(name)) windowListeners.set(name, new Set()); windowListeners.get(name).add(callback); },
     removeEventListener(name, callback) { windowListeners.get(name)?.delete(callback); },
@@ -182,6 +191,9 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
     HoverCard: props => view.React.createElement('native-hovercard', props, props.anchor),
     StateDot: props => view.React.createElement('native-state-dot', props),
     Switch: props => view.React.createElement('native-switch', props),
+    Toast: props => view.React.createElement('native-toast', props, props.text),
+    Input: props => view.React.createElement('input', props),
+    Checkbox: props => view.React.createElement('native-checkbox', props, props.label),
     relativeTime: () => ({ unit: 'minutes', n: 1 }),
   }, { get: (target, key) => target[key] || (props => view.React.createElement('native-icon', { ...props, name: key })) });
   const plugin = createPlugin(view.React, model, persistence, ui);
@@ -198,7 +210,7 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
   const cleanup = () => { view.unmount(); while (effects.length) effects.pop()(); };
   t.after(() => { cleanup(); global.window = previousWindow; console.error = previousError; console.warn = previousWarn; });
   return { plugin, ctx, slots, entries, native, archive, calls, errors, warnings, storage, subscriptions, sessions, workspaces,
-    windowListeners, render, click, emit, cleanup, renderToggle: () => nodes(view.render(entries.get('settings.section')[0].component, {}), node => node.type === 'native-switch')[0], get tree() { return tree; } };
+    windowListeners, render, click, emit, cleanup, renderSettings: () => view.render(entries.get('settings.section')[0].component, {}), renderToggle: () => nodes(view.render(entries.get('settings.section')[0].component, {}), node => node.type === 'native-switch')[0], get tree() { return tree; } };
 }
 
 test('folder summary uses native icons, hides zero groups, and updates while collapsed without storage writes', t => {
@@ -214,7 +226,10 @@ test('folder summary uses native icons, hides zero groups, and updates while col
   assert.equal(nodes(folder, n => n.props['data-activity'] === 'unread').length, 1);
   assert.ok(nodes(folder, n => n.props.name === 'IconWarningOutlineRegular').length);
   assert.ok(nodes(folder, n => n.props.name === 'IconCheckCircleOutlineRegular').length);
-  assert.match(nodes(folder, n => n.props.role === 'img')[0].props['aria-label'], /Includes subfolders[\s\S]*Unarchived sessions: 2/);
+  assert.equal(nodes(folder, n => n.type === 'native-hovercard').length, 0);
+  const pendingMenu = nodes(folder, n => n.type === 'native-menu' && n.props.className === 'dsmgr-folder-count')[0];
+  assert.equal(pendingMenu.props.anchor.props['aria-label'], 'Needs attention: 1, show');
+  assert.equal(pendingMenu.props.footer[0].text, 'Includes subfolders · Idle 0 · Unarchived sessions 2');
   statuses.set('s1', { running: true });
   folder = row(render(), 'folder:a');
   assert.ok(nodes(folder, n => n.type === 'native-state-dot' && n.props.state === 'ongoing' && n.props.size === 14).length);
@@ -222,6 +237,43 @@ test('folder summary uses native icons, hides zero groups, and updates while col
   folder = row(render(), 'folder:a');
   assert.equal(nodes(folder, n => n.props.className === 'dsmgr-folder-summary').length, 0);
   assert.equal(app.storage.writes, 0);
+});
+
+test('activity counts jump to their sessions: one opens directly, several open a menu, collapsed parents expand', async t => {
+  const state = { ...fixtureState(), sessionFolders: { s1: 'a', s2: 'a' }, expanded: { 'folder:a': false, 'workspace:"w"': false } };
+  const app = setup(t, { state });
+  const statuses = new Map([['s1', { pendingInteraction: { kind: 'approval' } }], ['s2', { pendingInteraction: { kind: 'input' } }], ['orphan', { completionUnread: true }]]);
+  const render = () => app.render({ useSessionStatus: selector => selector(statuses) });
+  const count = (root, kind) => nodes(root, n => n.type === 'native-menu' && n.props.className === 'dsmgr-folder-count' && n.props.anchor.props['data-activity'] === kind)[0];
+  const header = () => nodes(render(), n => n.type === 'header')[0];
+  await app.click(count(header(), 'pending').props.anchor);
+  const menu = count(header(), 'pending');
+  assert.equal(menu.props.open, true);
+  assert.deepEqual(menu.props.items.map(item => item.id), ['s1', 's2']);
+  menu.props.onSelect('s2');
+  await flush();
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's2']);
+  assert.deepEqual(JSON.parse(app.storage.raw).expanded, { 'folder:a': true, 'workspace:"w"': true });
+  await app.click(count(header(), 'unread').props.anchor);
+  assert.deepEqual(app.calls.at(-1), ['openSession', 'orphan']);
+});
+
+test('workspace rows and the header show the same summary, including ungrouped sessions in the header total', t => {
+  const state = { ...fixtureState(), expanded: { 'workspace:"w"': false } };
+  const app = setup(t, { state });
+  const statuses = new Map([['s1', { running: true }], ['orphan', { completionUnread: true }]]);
+  const tree = app.render({ useSessionStatus: selector => selector(statuses) });
+  const summaries = root => nodes(root, n => n.props.className === 'dsmgr-folder-summary');
+  const workspace = nodes(tree, n => n.props.className === 'dsmgr-row dsmgr-workspace').find(n => text(n).includes('Work'));
+  assert.equal(workspace.props['aria-expanded'], false);
+  const [own] = summaries(workspace);
+  const menus = root => nodes(root, n => n.type === 'native-menu' && n.props.className === 'dsmgr-folder-count');
+  assert.deepEqual(menus(own).map(m => m.props.anchor.props['aria-label']), ['Running: 1, show']);
+  assert.equal(menus(own)[0].props.footer[0].text, 'Includes all folders in this workspace · Idle 1 · Unarchived sessions 2');
+  const header = nodes(tree, n => n.type === 'header')[0];
+  const [all] = summaries(header);
+  assert.deepEqual(menus(all).map(m => m.props.anchor.props['data-activity']), ['running', 'unread']);
+  assert.equal(menus(all)[0].props.footer[0].text, 'All workspaces, including ungrouped · Idle 1 · Unarchived sessions 3');
 });
 
 test('factory declares dependencies and apply shadows native using options metadata, then cleans up', t => {
@@ -290,10 +342,15 @@ test('session opening, raw-title double-click rename, pin and native archive del
   assert.equal(app.storage.writes, 0);
 });
 
-test('folder and session titles expose their complete text as the native title hint', t => {
+test('folders keep a title hint; sessions show title and age in a native row hover card', t => {
   const tree = setup(t).render();
-  for (const [key, label] of [['folder:a', 'Alpha'], ['session:s1', 'First']])
-    assert.equal(nodes(row(tree, key), n => n.props.className === 'dsmgr-label')[0].props.title, label);
+  assert.equal(nodes(row(tree, 'folder:a'), n => n.props.className === 'dsmgr-label')[0].props.title, 'Alpha');
+  assert.equal(nodes(row(tree, 'session:s1'), n => n.props.className === 'dsmgr-label')[0].props.title, undefined);
+  const card = nodes(tree, n => n.type === 'native-hovercard' && n.props.anchor?.props['data-dsm-key'] === 'session:s1')[0];
+  assert.ok(card);
+  const content = card.props.content;
+  assert.equal(content.props.className, 'dsmgr-hover');
+  assert.deepEqual(content.children.filter(Boolean).map(child => child.children.join('')), ['First', '1m ago']);
 });
 
 test('session navigation remains available while another sidebar action is pending', async t => {
@@ -423,7 +480,7 @@ test('folder delete-to-root removes subtree mappings without native archival', a
   let tree = app.render();
   await app.click(button(row(tree, 'folder:a'), 'Delete folder'));
   tree = app.render();
-  await app.click(button(tree, 'Move sessions to workspace root'));
+  await confirmDelete(app, false);
   const persisted = JSON.parse(app.storage.raw);
   assert.deepEqual(persisted.folders.map(folder => folder.id), ['b']);
   assert.deepEqual(persisted.sessionFolders, {});
@@ -436,7 +493,7 @@ test('archive-and-delete uses native safety controller, skips already archived s
   let tree = app.render();
   await app.click(button(row(tree, 'folder:a'), 'Delete folder'));
   tree = app.render();
-  await app.click(button(tree, 'Archive sessions and delete'));
+  await confirmDelete(app, true);
   assert.deepEqual(app.calls.filter(call => call[0] === 'archiveSession'), [['archiveSession', 's1']]);
   assert.deepEqual(JSON.parse(app.storage.raw).folders.map(folder => folder.id), ['b']);
 });
@@ -508,11 +565,11 @@ test('archive rejection keeps folder assignments and dialog available', async t 
   let tree = app.render();
   await app.click(button(row(tree, 'folder:a'), 'Delete folder'));
   tree = app.render();
-  await app.click(button(tree, 'Archive sessions and delete'));
+  await confirmDelete(app, true);
   assert.deepEqual(JSON.parse(app.storage.raw), state);
   assert.equal(app.storage.writes, 0);
   assert.match(text(app.render()), /Session is running/);
-  assert.ok(button(app.tree, 'Archive sessions and delete'));
+  assert.equal(nodes(app.tree, node => node.type === 'native-checkbox')[0].props.checked, true);
 });
 
 test('partially completed bulk archive retains all folder metadata for recovery', async t => {
@@ -526,7 +583,7 @@ test('partially completed bulk archive retains all folder metadata for recovery'
   let tree = app.render();
   await app.click(button(row(tree, 'folder:a'), 'Delete folder'));
   tree = app.render();
-  await app.click(button(tree, 'Archive sessions and delete'));
+  await confirmDelete(app, true);
   assert.deepEqual(archived, ['s1']);
   assert.deepEqual(JSON.parse(app.storage.raw), state);
   assert.equal(app.storage.writes, 0);
@@ -712,7 +769,6 @@ test('unread completion uses native done dot and accessible label, absent on ord
   assert.ok(unread);
   assert.equal(nodes(unread, node => node.type === 'native-state-dot')[0].props.state, 'done');
   assert.equal(nodes(row(tree, 'session:s2'), node => node.props['aria-label'] === 'Unread completion').length, 0);
-  assert.equal(nodes(row(tree, 'session:s2'), node => node.type === 'small').length, 0);
 });
 
 test('parent subagent count uses direct native catalog, live status precedence and list fallback', t => {
@@ -730,14 +786,14 @@ test('parent subagent count uses direct native catalog, live status precedence a
     ['s1', { running: false }], ['childLive', { running: true }], ['childStopped', { running: false }],
   ]);
   let tree = app.render({ useSessionStatus: selector => selector(statuses) });
-  const count = nodes(row(tree, 'session:s1'), node => node.type === 'small')[0];
-  assert.ok(count);
-  assert.equal(text(count), '+2');
-  assert.equal(count.props['aria-label'], 'Running: 2');
-  assert.equal(nodes(row(tree, 'session:s2'), node => node.type === 'small').length, 0);
+  // The count lives in the status slot label instead of an inline "+N".
+  const label = key => nodes(row(tree, key), node => String(node.props.className).startsWith('dsmgr-status'))[0].props['aria-label'];
+  assert.equal(label('session:s1'), 'Running · 2 running subagents');
+  assert.equal(nodes(tree, node => node.type === 'small').length, 0);
+  assert.equal(label('session:s2'), undefined);
   app.sessions.value.projectionsBySession.s1.values.subagentCatalog = [];
   tree = app.render({ useSessionStatus: selector => selector(statuses) });
-  assert.equal(nodes(row(tree, 'session:s1'), node => node.type === 'small').length, 0);
+  assert.equal(label('session:s1'), undefined);
 });
 
 test('delayed event uses latest stored value; foreign area ignored and clear event resets', t => {
@@ -773,15 +829,57 @@ test('native UI primitives replace glyphs, use themed 14px rows and contain icon
   assert.equal(text(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-time')[0]), '1m');
 });
 
-test('nested folder colors differ and native menu exposes new, rename and delete actions', t => {
+test('nested folder icons cycle tones by depth and native menu exposes new, rename and delete actions', t => {
   const state = model.createFolder(fixtureState(), { id: 'child', parentId: 'a', workspaceId: 'w', name: 'Child' });
   const app = setup(t, { state });
   const tree = app.render();
-  const color = key => nodes(row(tree, key), node => node.props.className === 'dsmgr-folder-icon')[0].props.style.color;
-  assert.notEqual(color('folder:a'), color('folder:child'));
+  const tone = key => nodes(row(tree, key), node => node.props.className === 'dsmgr-folder-icon')[0].props['data-tone'];
+  assert.deepEqual([tone('folder:a'), tone('folder:child')], [0, 1]);
   const menus = nodes(row(tree, 'folder:a'), node => node.type === 'native-menu');
   assert.deepEqual(menus[0].props.items.map(item => item.id), ['folder', 'session', 'rename', 'delete']);
   assert.equal(menus[0].props.portal, true);
+});
+
+test('right-clicking a folder opens its menu at the cursor; sessions keep the browser default', t => {
+  const app = setup(t);
+  let prevented = false;
+  row(app.render(), 'folder:a').props.onContextMenu(event({ clientX: 40, clientY: 90, preventDefault() { prevented = true; } }));
+  assert.equal(prevented, true);
+  let menu = nodes(row(app.render(), 'folder:a'), node => node.type === 'native-menu')[0];
+  assert.equal(menu.props.open, true);
+  assert.deepEqual(menu.props.getAnchorRect(), { left: 40, right: 40, top: 90, bottom: 90 });
+  menu.props.onClose();
+  menu = nodes(row(app.render(), 'folder:a'), node => node.type === 'native-menu')[0];
+  assert.equal(menu.props.open, false);
+  assert.equal(menu.props.getAnchorRect, undefined);
+  assert.equal(row(app.tree, 'session:s1').props.onContextMenu, undefined);
+});
+
+test('session rows have a quick archive button; archived rows get quick restore; drafts get neither', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  const quick = key => nodes(row(tree, key), node => node.type === 'button' && node.props.className === 'dsmgr-icon-button' && node.props['aria-label'] !== 'More actions');
+  await app.click(quick('session:s1')[0]);
+  assert.deepEqual(app.calls.at(-1), ['archive-native', 's1']);
+  assert.equal(quick('session:blank').length, 0);
+  await app.click(button(app.render(), 'Archived'));
+  tree = app.render();
+  assert.equal(quick('session:archived')[0].props['aria-label'], 'Restore');
+});
+
+test('custom folder colors persist, tint the tree through CSS variables and reset to theme defaults', t => {
+  const app = setup(t);
+  const COLORS = 'dsh.session-manager.folder-colors';
+  const pickers = () => nodes(app.renderSettings(), node => node.type === 'input' && node.props.type === 'color');
+  assert.equal(pickers().length, 3);
+  pickers()[1].props.onChange({ target: { value: '#123456' } });
+  assert.deepEqual(JSON.parse(app.storage.other[COLORS]), [null, '#123456', null]);
+  assert.deepEqual(app.render().props.style, { '--dsmgr-tone-1': '#123456' });
+  const reset = nodes(app.renderSettings(), node => node.type === 'button' && text(node) === 'Reset')[0];
+  reset.props.onClick();
+  assert.equal(app.storage.other[COLORS], undefined);
+  assert.deepEqual(app.render().props.style, {});
+  assert.equal(app.storage.writes, 0);
 });
 
 test('archived toggle mixes gray rows into normal ordering and folder, without a separate list or pin priority', async t => {
