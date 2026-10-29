@@ -126,11 +126,19 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
   const storage = { raw, writes: 0, mode, other: {},
     getItem: key => key === KEY ? storage.raw : key === MODE ? storage.mode : storage.other[key] ?? null,
     setItem(key, value) { if (key === MODE) { storage.mode = value; return; } if (key !== KEY) { storage.other[key] = value; return; } storage.raw = value; storage.writes++; },
-    removeItem(key) { delete storage.other[key]; } };
-  global.window = { localStorage: storage,
+    removeItem(key) { delete storage.other[key]; },
+    // Host storage surface: subscribers hear keys another shell (or a rejected write) changed.
+    listeners: new Set(),
+    subscribe(listener) { storage.listeners.add(listener); return () => storage.listeners.delete(listener); },
+    refresh() { calls.push(['refresh']); },
+    emit(key, failure) { for (const listener of [...storage.listeners]) listener(key, failure); } };
+  const listen = {
     addEventListener(name, callback) { if (!windowListeners.has(name)) windowListeners.set(name, new Set()); windowListeners.get(name).add(callback); },
     removeEventListener(name, callback) { windowListeners.get(name)?.delete(callback); },
   };
+  const previousDocument = global.document;
+  global.window = { ...listen };
+  global.document = { ...listen, visibilityState: 'visible', baseURI: 'http://127.0.0.1/' };
   const sessions = source({ phase: 'ready', ids: ['s1', 's2', 'blank', 'archived', 'orphan'], byId: {
     s1: { id: 's1', title: '  First  ', displayTitle: 'First', updatedAt: 20, running: false },
     s2: { id: 's2', title: 'Second', displayTitle: 'Second', updatedAt: 10, running: false },
@@ -196,7 +204,15 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
     Checkbox: props => view.React.createElement('native-checkbox', props, props.label),
     relativeTime: () => ({ unit: 'minutes', n: 1 }),
   }, { get: (target, key) => target[key] || (props => view.React.createElement('native-icon', { ...props, name: key })) });
-  const plugin = createPlugin(view.React, model, persistence, ui);
+  // Synchronous stand-in for the host fetch so apply() finishes before the test renders.
+  const hostPersistence = { ...persistence, openHostStorage(url) {
+    calls.push(['open', url]);
+    return { then(resolve) {
+      try { resolve(storage); } catch (error) { return { catch(handle) { handle(error); } }; }
+      return { catch() {} };
+    } };
+  } };
+  const plugin = createPlugin(view.React, model, hostPersistence, ui);
   plugin.apply(ctx);
   function render(props = {}) {
     const registered = entries.get(WORKSPACES).find(entry => entry.options.priority === -10);
@@ -208,7 +224,7 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
   }
   async function click(target, options) { assert.notEqual(target.props.disabled, true); target.props.onClick(event(options)); await flush(); }
   const cleanup = () => { view.unmount(); while (effects.length) effects.pop()(); };
-  t.after(() => { cleanup(); global.window = previousWindow; console.error = previousError; console.warn = previousWarn; });
+  t.after(() => { cleanup(); global.window = previousWindow; global.document = previousDocument; console.error = previousError; console.warn = previousWarn; });
   return { plugin, ctx, slots, entries, native, archive, calls, errors, warnings, storage, subscriptions, sessions, workspaces,
     windowListeners, render, click, emit, cleanup, renderSettings: () => view.render(entries.get('settings.section')[0].component, {}), renderToggle: () => nodes(view.render(entries.get('settings.section')[0].component, {}), node => node.type === 'native-switch')[0], get tree() { return tree; } };
 }
@@ -282,13 +298,18 @@ test('factory declares dependencies and apply shadows native using options metad
   assert.deepEqual(app.calls.filter(call => call[0] === 'register' && call[1] === WORKSPACES), [['register', WORKSPACES, -10]]);
   assert.equal(app.entries.get(WORKSPACES).includes(app.native), true);
   app.render();
-  assert.equal(app.windowListeners.get('storage').size, 2);
+  assert.deepEqual(app.calls.find(call => call[0] === 'open'), ['open', 'http://127.0.0.1/dsh-session-manager/storage']);
+  assert.equal(app.storage.listeners.size, 2);
+  assert.equal(app.windowListeners.get('focus').size, 1);
+  assert.equal(app.windowListeners.get('visibilitychange').size, 1);
   assert.equal(app.sessions.listeners.size, 1);
   app.cleanup();
   assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
   assert.equal(app.subscriptions.get(WORKSPACES).size, 0);
   assert.equal(app.subscriptions.get(MENU).size, 0);
-  assert.equal(app.windowListeners.get('storage').size, 0);
+  assert.equal(app.storage.listeners.size, 0);
+  assert.equal(app.windowListeners.get('focus').size, 0);
+  assert.equal(app.windowListeners.get('visibilitychange').size, 0);
   assert.equal(app.sessions.listeners.size, 0);
   assert.ok(app.calls.some(call => call[0] === 'locale-dispose'));
 });
@@ -498,32 +519,39 @@ test('archive-and-delete uses native safety controller, skips already archived s
   assert.deepEqual(JSON.parse(app.storage.raw).folders.map(folder => folder.id), ['b']);
 });
 
-test('external storage event reloads folder state and clears drag undo', t => {
+test('host change from another shell reloads folder state and clears drag undo', t => {
   const app = setup(t);
   let tree = app.render();
   row(tree, 'session:s1').props.onDragStart(event());
   row(tree, 'folder:a').props.onDrop(event());
   const external = model.renameFolder(fixtureState(), 'b', 'Other window');
   app.storage.raw = JSON.stringify(external);
-  const dispatch = (overrides = {}) => {
-    for (const listener of app.windowListeners.get('storage')) listener({ storageArea: window.localStorage, key: KEY, newValue: app.storage.raw, ...overrides });
-  };
-  dispatch({ key: 'unrelated' });
+  app.storage.emit('dsh.session-manager.unrelated', null);
   assert.match(text(app.render()), /Moved/);
-  dispatch();
+  app.storage.emit(KEY, null);
   tree = app.render();
   assert.equal(nodes(tree, node => node.type === 'native-menu').flatMap(node => node.props.items).some(item => item.id === 'undo'), false);
   assert.match(text(row(tree, 'folder:b')), /Other window/);
   tree.props.onKeyDown(event({ ctrlKey: true, key: 'z', target: { closest: () => null } }));
   assert.equal(app.storage.writes, 1);
-  assert.equal(app.storage.writes, 1);
+  assert.match(text(tree), /Another window updated folders/);
 });
 
-test('corrupt storage event reports error and keeps rendered last-valid folders', t => {
+test('plain sync from another shell reloads silently when there is no undo to lose', t => {
+  const app = setup(t);
+  app.render();
+  app.storage.raw = JSON.stringify(model.renameFolder(fixtureState(), 'b', 'Other window'));
+  app.storage.emit(KEY, null);
+  const tree = app.render();
+  assert.match(text(row(tree, 'folder:b')), /Other window/);
+  assert.doesNotMatch(text(tree), /Another window updated folders/);
+});
+
+test('corrupt host change reports error and keeps rendered last-valid folders', t => {
   const app = setup(t);
   app.render();
   app.storage.raw = '{bad';
-  for (const listener of app.windowListeners.get('storage')) listener({ storageArea: window.localStorage, key: KEY, newValue: app.storage.raw });
+  app.storage.emit(KEY, null);
   const tree = app.render();
   assert.ok(row(tree, 'folder:a'));
   assert.equal(app.errors.length, 1);
@@ -737,7 +765,7 @@ test('saved native mode survives initialization and cross-window changes restore
   assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
   assert.equal(app.renderToggle().props.checked, false);
   app.storage.mode = 'true';
-  for (const listener of app.windowListeners.get('storage')) listener({ key: 'dsh.session-manager.tree-view', storageArea: app.storage });
+  app.storage.emit('dsh.session-manager.tree-view', null);
   assert.ok(app.entries.get(WORKSPACES).some(entry => entry.options.priority === -10));
   assert.equal(app.renderToggle().props.checked, true);
 });
@@ -796,21 +824,21 @@ test('parent subagent count uses direct native catalog, live status precedence a
   assert.equal(label('session:s1'), undefined);
 });
 
-test('delayed event uses latest stored value; foreign area ignored and clear event resets', t => {
+test('host change uses the latest stored value, a failed write reverts and is shown, and a cleared key resets', t => {
   const app = setup(t);
   app.render();
   const latest = model.renameFolder(fixtureState(), 'a', 'Latest state');
   app.storage.raw = JSON.stringify(latest);
-  const dispatch = options => {
-    for (const listener of app.windowListeners.get('storage')) listener({ storageArea: window.localStorage, key: KEY, newValue: '{}', ...options });
-  };
-  dispatch({ storageArea: {} });
-  assert.match(text(row(app.render(), 'folder:a')), /Alpha/);
-  dispatch();
+  app.storage.emit(KEY, null);
   assert.match(text(row(app.render(), 'folder:a')), /Latest state/);
   assert.equal(app.errors.length, 0);
+  app.storage.raw = JSON.stringify(fixtureState());
+  app.storage.emit(KEY, new Error('Changed in another window'));
+  assert.match(text(app.render()), /Operation failed: Changed in another window/);
+  assert.match(text(row(app.render(), 'folder:a')), /Alpha/);
+  assert.equal(app.errors.length, 1);
   app.storage.raw = null;
-  dispatch({ key: null, newValue: null });
+  app.storage.emit(KEY, null);
   assert.equal(nodes(app.render(), node => node.props['data-dsm-key'] === 'folder:a').length, 0);
   assert.equal(app.storage.writes, 0);
 });

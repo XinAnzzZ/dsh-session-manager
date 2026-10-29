@@ -7,6 +7,8 @@ module.exports = function createPlugin(React, model, persistence, ui) {
   const COLOR_KEY = 'dsh.session-manager.folder-colors';
   const TAG_KEY = 'dsh.session-manager.tags';
   const NEW_TAG = '\0new-tag';
+  // Host route registered by index.js; relative so it resolves against the page's base URL.
+  const ROUTE = 'dsh-session-manager/storage';
   // Light-theme defaults per nesting level; the stylesheet carries the dark-theme pair.
   const TONES = ['#8b5cf6', '#0d9488', '#db2777'];
   // Quick picks shared by folder levels and tags; includes both sets of defaults.
@@ -51,7 +53,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       tagSettingsDescription: '在会话的「更多操作」或右键菜单中添加标签，多选后可批量添加；一次性标签在从侧栏打开会话后自动清除。',
       editTag: '编辑标签', deleteTag: '删除标签', deleteTagMessage: '将删除标签「{name}」，并从 {n} 个会话移除。', tagUsage: '{n} 个会话',
       tagStorageError: '标签数据无法读取，已停止写入以免覆盖已保存数据。',
-      presetColors: '标准色', eyedropper: '吸取屏幕颜色', hue: '色相',
+      presetColors: '标准色', hue: '色相',
     },
     en: {
       summary: 'Includes subfolders', workspaceSummary: 'Includes all folders in this workspace', totalSummary: 'All workspaces, including ungrouped', total: 'Unarchived sessions', idle: 'Idle',
@@ -78,7 +80,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       tagSettingsDescription: 'Add tags from a session\'s More actions or context menu, or to several selected sessions at once. One-shot tags clear when the session is opened from the sidebar.',
       editTag: 'Edit tag', deleteTag: 'Delete tag', deleteTagMessage: 'Delete tag "{name}" and remove it from {n} sessions.', tagUsage: '{n} sessions',
       tagStorageError: 'Tag data could not be read. Writes are paused so saved data is not overwritten.',
-      presetColors: 'Standard colors', eyedropper: 'Pick a color from the screen', hue: 'Hue',
+      presetColors: 'Standard colors', hue: 'Hue',
     },
   };
   const workspaceKey = (id) => 'workspace:' + JSON.stringify(id);
@@ -117,7 +119,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       kind === 'running' ? h(ui.StateDot, { state: 'ongoing', size: 14 }) : icon(kind === 'pending' ? 'WarningOutline' : 'CheckCircleOutline', { size: 14 }),
       h('span', null, count)) });
   }
-  // Swatch button + popover: standard colors first, then saturation/value square, hue, optional eyedropper, RGB/Hex.
+  // Swatch button + popover: standard colors first, then saturation/value square, hue, RGB/Hex.
   // Every adjustment is reported through onChange immediately, so the tree previews while dragging.
   function ColorPicker({ value, label, t, onChange, className = 'dsmgr-color' }) {
     const [open, setOpen] = React.useState(false), [hsv, setHsv] = React.useState(() => hsvOf(value));
@@ -142,8 +144,6 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       const rect = event.currentTarget.getBoundingClientRect(), clamp = (n) => Math.min(1, Math.max(0, n));
       hsvChange({ h: hsv.h, s: clamp((event.clientX - rect.left) / rect.width), v: clamp(1 - (event.clientY - rect.top) / rect.height) });
     };
-    const sample = () => new window.EyeDropper().open().then((result) => pick(result.sRGBHex),
-      (error) => { if (error?.name !== 'AbortError') console.error('DSH Session Manager:', error); });
     const field = (key, name, size) => h('label', { key, className: 'dsmgr-picker-field' },
       h('input', { value: shown[key], size, spellCheck: false, 'aria-label': name, onChange: (event) => edit(key, event.target.value.trim()), onBlur: () => setText(null) }), name);
     return h(ui.Menu, { open, onClose: () => setOpen(false), portal: true, align: 'start', listClassName: 'dsmgr-picker',
@@ -157,13 +157,9 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         h('div', { className: 'dsmgr-picker-sv', style: { backgroundColor: hexOfHsv({ h: hsv.h, s: 1, v: 1 }) },
           onPointerDown: drag, onPointerMove: drag },
           h('span', { className: 'dsmgr-picker-thumb', style: { left: hsv.s * 100 + '%', top: (1 - hsv.v) * 100 + '%' } })),
+        // No eyedropper: DSH Desktop's Electron exposes window.EyeDropper, but on Windows open() only hides the cursor
+        // and never picks (electron/electron#44917, closed unfixed), so the button would be a dead control.
         h('div', { className: 'dsmgr-picker-row' },
-          typeof window.EyeDropper === 'function' && h('button', { type: 'button', className: 'dsmgr-icon-button', title: t('eyedropper'),
-            'aria-label': t('eyedropper'), onClick: sample },
-            // The native icon set has no eyedropper; InspectOutline reads as "</>".
-            // Pipette glyph adapted from Lucide (ISC).
-            h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
-              h('path', { d: 'm2 22 1-1h3l9-9M3 21v-3l9-9m3-3 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z' }))),
           h('span', { className: 'dsmgr-picker-preview', style: { background: hex } }),
           h('input', { type: 'range', className: 'dsmgr-picker-hue', min: 0, max: 359, value: Math.round(hsv.h), 'aria-label': t('hue'),
             onChange: (event) => hsvChange({ ...hsv, h: Number(event.target.value) }) })),
@@ -234,9 +230,8 @@ module.exports = function createPlugin(React, model, persistence, ui) {
     apply(ctx) {
       ctx.effect(() => ctx.locale.register(NS, dictionaries), 'session-manager: locale');
       const t = ctx.locale.bind(NS);
-      let store;
-      try { store = persistence.createStore(window.localStorage, KEY); }
-      catch (error) { console.error(t('storageError'), error); return; }
+      // Both are assigned once the host data has loaded (end of apply); nothing below reads them before that.
+      let storage, store;
       const source = (service) => ({ subscribe: (listener) => service.list.subscribe(listener), getSnapshot: () => service.list.getSnapshot() });
       const sessionSource = source(ctx.sessions), workspaceSource = source(ctx.workspaces);
       let adapter, dragging = null, disposeTree;
@@ -254,11 +249,10 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       const setColors = (next) => { folderColors = next; for (const listener of colorListeners) listener(); };
       function readColors() {
         try {
-          const saved = JSON.parse(window.localStorage.getItem(COLOR_KEY) || 'null');
+          const saved = JSON.parse(storage.getItem(COLOR_KEY) || 'null');
           setColors(TONES.map((_, index) => /^#[0-9a-f]{6}$/i.test(saved?.[index]) ? saved[index] : null));
         } catch (error) { report(error); setColors([null, null, null]); }
       }
-      readColors();
       // Session tags. Absent key = first run, so the default tags appear; deleting one persists the remaining list.
       // An unreadable value pauses writes (tagError) instead of overwriting what the user saved.
       const defaultTags = () => ({ version: 1, sessions: {}, tags: [
@@ -272,7 +266,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       const publishTags = (next) => { tags = next; for (const listener of tagListeners) listener(); };
       function readTags() {
         try {
-          const raw = window.localStorage.getItem(TAG_KEY);
+          const raw = storage.getItem(TAG_KEY);
           tagError = null; publishTags(raw === null ? defaultTags() : model.validateTags(JSON.parse(raw)));
         } catch (error) { report(error); tagError = error; publishTags({ version: 1, tags: [], sessions: {} }); }
       }
@@ -280,10 +274,9 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         if (tagError) throw new Error(t('tagStorageError'));
         const next = model.validateTags(transform(tags));
         if (next === tags) return;
-        window.localStorage.setItem(TAG_KEY, JSON.stringify(next));
+        storage.setItem(TAG_KEY, JSON.stringify(next));
         publishTags(next);
       }
-      readTags();
       // shortcut: native dialog callbacks are introspected in 0.2.1-rc.2; use a public action API when DSH exposes one.
       function discover() {
         const native = ctx.slots.entries('sidebar.workspaces').find((entry) => (entry.options?.priority ?? 0) === 0 && entry.inject);
@@ -428,15 +421,19 @@ module.exports = function createPlugin(React, model, persistence, ui) {
             : rootRef.current?.querySelector('[data-dsm-key=' + JSON.stringify(key) + ']')?.getBoundingClientRect() ?? null;
           setTagMenu({ ids, rect: r ? { left: r.left, right: r.right, top: r.top, bottom: r.bottom } : { left: 0, right: 0, top: 0, bottom: 0 } });
         }
-        React.useEffect(() => {
-          const listener = (event) => {
-            if (event.storageArea !== window.localStorage || (event.key !== KEY && event.key !== null)) return;
-            try { store.reload(window.localStorage.getItem(KEY)); setMessage(t('changed')); }
-            catch (error) { report(error); setMessage(t('failed') + ': ' + error.message); }
-          };
-          window.addEventListener('storage', listener);
-          return () => window.removeEventListener('storage', listener);
-        }, []);
+        // Another shell changed the folders (conflict or refresh), or a write failed and the store reverts to the host copy.
+        React.useEffect(() => storage.subscribe((key, failure) => {
+          if (key !== KEY) return;
+          if (failure) report(failure);
+          // Plain cross-window sync stays silent; only speak up when a failure reverted us or undo history was lost.
+          try {
+            const hadUndo = store.canUndo();
+            store.reload(storage.getItem(KEY));
+            if (failure) setMessage(t('failed') + ': ' + failure.message);
+            else if (hadUndo) setMessage(t('changed'));
+          }
+          catch (error) { report(error); setMessage(t('failed') + ': ' + error.message); }
+        }), []);
         const button = (label, onClick, danger = false) => h(ui.Button, { key: label, variant: 'outline', type: 'button', className: danger ? 'dsmgr-delete-danger' : undefined, title: label, 'aria-label': label,
           disabled: busy, onClick: (event) => { event.stopPropagation(); onClick(event); } }, label);
         const iconButton = (label, artwork, onClick, disabled = false) => h('button', { type: 'button', className: 'dsmgr-icon-button',
@@ -658,10 +655,22 @@ module.exports = function createPlugin(React, model, persistence, ui) {
                 ? model.createFolder(previous, { id: crypto.randomUUID(), workspaceId: dialog.workspaceId, parentId: dialog.parentId, name })
                 : model.renameFolder(previous, dialog.row.id, name)) })));
       }
+      // Load the shared host copy first; the tree, settings and listeners start once it is here.
       ctx.effect(() => {
-        let reconciling = false, nativeMode = false;
-        try { nativeMode = window.localStorage.getItem(MODE_KEY) === 'false'; }
-        catch (error) { report(error); }
+        let disposed = false, stop;
+        const url = typeof document === 'undefined' ? ROUTE : new URL(ROUTE, document.baseURI).toString();
+        persistence.openHostStorage(url).then((loaded) => {
+          if (disposed) return;
+          storage = loaded;
+          store = persistence.createStore(storage, KEY);
+          readColors(); readTags();
+          stop = start();
+        }).catch((error) => console.error(t('storageError'), error));
+        return () => { disposed = true; stop?.(); };
+      }, 'session-manager: sidebar tree');
+      function start() {
+        let reconciling = false;
+        let nativeMode = storage.getItem(MODE_KEY) === 'false';
         const modeListeners = new Set();
         const modeSource = { subscribe: (listener) => { modeListeners.add(listener); return () => modeListeners.delete(listener); },
           getSnapshot: () => nativeMode };
@@ -694,7 +703,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
               error && h('div', { role: 'alert', className: 'dsmgr-name-error' }, error)),
             h(ui.Switch, { checked: !native, label: t('treeView'), onChange: (checked) => {
               try {
-                window.localStorage.setItem(MODE_KEY, String(checked));
+                storage.setItem(MODE_KEY, String(checked));
                 nativeMode = !checked; reconcile(); for (const listener of modeListeners) listener(); setError('');
               } catch (reason) { report(reason); setError(reason.message); }
             } }));
@@ -703,8 +712,8 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           const colors = useSource(colorSource), [error, setError] = React.useState('');
           const save = (next) => {
             try {
-              if (next.every((color) => color === null)) window.localStorage.removeItem(COLOR_KEY);
-              else window.localStorage.setItem(COLOR_KEY, JSON.stringify(next));
+              if (next.every((color) => color === null)) storage.removeItem(COLOR_KEY);
+              else storage.setItem(COLOR_KEY, JSON.stringify(next));
               setColors(next); setError('');
             } catch (reason) { report(reason); setError(reason.message); }
           };
@@ -747,20 +756,26 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         const disposeSettings = ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section', id: NS, order: 50, locale: NS, label: () => t('title'),
         }, function SettingsSection() { return h('div', null, h(Settings), h(ColorSettings), h(TagSettings)); }));
-        const syncMode = (event) => {
-          if (event.storageArea && event.storageArea !== window.localStorage) return;
-          if (event.key === null || event.key === COLOR_KEY) readColors();
-          if (event.key === null || event.key === TAG_KEY) readTags();
-          if (event.key !== null && event.key !== MODE_KEY) return;
-          try {
-            nativeMode = window.localStorage.getItem(MODE_KEY) === 'false';
-            reconcile(); for (const listener of modeListeners) listener();
-          } catch (error) { report(error); }
-        };
-        window.addEventListener('storage', syncMode);
+        // Another shell (or a rejected write) changed a key; folders are handled by the tree itself.
+        const disposeSync = storage.subscribe((key, failure) => {
+          if (failure && key !== KEY) report(failure);
+          if (key === null || key === COLOR_KEY) readColors();
+          if (key === null || key === TAG_KEY) readTags();
+          if (key !== null && key !== MODE_KEY) return;
+          nativeMode = storage.getItem(MODE_KEY) === 'false';
+          reconcile(); for (const listener of modeListeners) listener();
+        });
+        // Changes from the other shell arrive when this window comes back into use.
+        const refresh = () => { if (document.visibilityState !== 'hidden') storage.refresh(); };
+        window.addEventListener('focus', refresh);
+        document.addEventListener('visibilitychange', refresh);
         reconcile();
-        return () => { dispose(); disposeMenu(); disposeSearch?.(); disposeSettings(); window.removeEventListener('storage', syncMode); disposeTree?.(); disposeTree = undefined; };
-      }, 'session-manager: sidebar tree');
+        return () => {
+          dispose(); disposeMenu(); disposeSearch?.(); disposeSettings(); disposeSync();
+          window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', refresh);
+          disposeTree?.(); disposeTree = undefined;
+        };
+      }
     },
   };
 };

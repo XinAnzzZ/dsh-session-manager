@@ -107,4 +107,50 @@ function createStore(storage, key, onError) {
   };
 }
 
-module.exports = { createStore };
+// Plugin data lives on the DSH host (one JSON file under the DSH home), so every shell on this machine shares it.
+// Reads come from the loaded copy; writes update it at once and reach the host in order. A rejected write
+// (another shell changed the key first, or the host failed) restores the host copy and is passed to subscribers.
+async function openHostStorage(url, request = (...args) => fetch(...args)) {
+  const call = async (body) => {
+    const headers = { 'x-dsh-plugin': 'dsh-session-manager' };
+    const response = await request(url, body
+      ? { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(body) }
+      : { cache: 'no-store', headers });
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result?.ok) throw Object.assign(new Error(result?.error || 'HTTP ' + response.status), { data: result?.data });
+    return result.data;
+  };
+  let data = await call();
+  let queue = Promise.resolve();
+  const listeners = new Set();
+  const emit = (key, failure) => { for (const listener of [...listeners]) listener(key, failure); };
+  const settle = (fresh) => {
+    const changed = [...new Set([...Object.keys(data), ...Object.keys(fresh)])].filter((key) => data[key] !== fresh[key]);
+    data = fresh;
+    return changed;
+  };
+  const write = (key, value) => {
+    const previous = data[key] ?? null;
+    if (previous === value) return;
+    data = { ...data };
+    if (value === null) delete data[key]; else data[key] = value;
+    queue = queue.then(() => call({ key, value, previous })).catch(async (error) => {
+      try { settle(error.data ?? await call()); } catch (reason) { emit(key, reason); }
+      emit(key, error);
+    });
+  };
+  return {
+    getItem: (key) => data[key] ?? null,
+    setItem: (key, value) => write(key, String(value)),
+    removeItem: (key) => write(key, null),
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    // Picks up changes made by another shell; queued behind pending writes so it never undoes them.
+    refresh() {
+      queue = queue.then(async () => { for (const key of settle(await call())) emit(key, null); })
+        .catch((error) => emit(null, error));
+      return queue;
+    },
+  };
+}
+
+module.exports = { createStore, openHostStorage };
