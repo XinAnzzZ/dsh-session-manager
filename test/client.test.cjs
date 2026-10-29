@@ -187,7 +187,7 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
   const ui = new Proxy({
     Modal: props => view.React.createElement('native-modal', props, props.children, props.footer),
     Button: props => view.React.createElement('button', props, props.children),
-    Menu: props => view.React.createElement('native-menu', props, props.anchor),
+    Menu: props => view.React.createElement('native-menu', props, props.anchor, props.open && props.children),
     HoverCard: props => view.React.createElement('native-hovercard', props, props.anchor),
     StateDot: props => view.React.createElement('native-state-dot', props),
     Switch: props => view.React.createElement('native-switch', props),
@@ -840,7 +840,7 @@ test('nested folder icons cycle tones by depth and native menu exposes new, rena
   assert.equal(menus[0].props.portal, true);
 });
 
-test('right-clicking a folder opens its menu at the cursor; sessions keep the browser default', t => {
+test('right-clicking a folder opens its menu at the cursor; sessions open the tag checklist, drafts keep the browser default', t => {
   const app = setup(t);
   let prevented = false;
   row(app.render(), 'folder:a').props.onContextMenu(event({ clientX: 40, clientY: 90, preventDefault() { prevented = true; } }));
@@ -852,7 +852,13 @@ test('right-clicking a folder opens its menu at the cursor; sessions keep the br
   menu = nodes(row(app.render(), 'folder:a'), node => node.type === 'native-menu')[0];
   assert.equal(menu.props.open, false);
   assert.equal(menu.props.getAnchorRect, undefined);
-  assert.equal(row(app.tree, 'session:s1').props.onContextMenu, undefined);
+  let draftPrevented = false;
+  row(app.tree, 'session:blank').props.onContextMenu(event({ preventDefault() { draftPrevented = true; } }));
+  assert.equal(draftPrevented, false);
+  row(app.tree, 'session:s1').props.onContextMenu(event({ clientX: 10, clientY: 20, preventDefault() {} }));
+  const tagMenu = nodes(app.render(), node => node.type === 'native-menu' && node.props.items.some(item => item.id === '\0new-tag'))[0];
+  assert.ok(tagMenu, 'Expected tag checklist');
+  assert.deepEqual(tagMenu.props.getAnchorRect(), { left: 10, right: 10, top: 20, bottom: 20 });
 });
 
 test('session rows have a quick archive button; archived rows get quick restore; drafts get neither', async t => {
@@ -870,10 +876,22 @@ test('session rows have a quick archive button; archived rows get quick restore;
 test('custom folder colors persist, tint the tree through CSS variables and reset to theme defaults', t => {
   const app = setup(t);
   const COLORS = 'dsh.session-manager.folder-colors';
-  const pickers = () => nodes(app.renderSettings(), node => node.type === 'input' && node.props.type === 'color');
+  const pickers = () => nodes(app.renderSettings(), node => node.type === 'button' && node.props.className === 'dsmgr-color');
   assert.equal(pickers().length, 3);
-  pickers()[1].props.onChange({ target: { value: '#123456' } });
+  assert.equal(nodes(app.renderSettings(), node => node.type === 'input' && node.props.type === 'color').length, 0);
+  pickers()[1].props.onClick(event());
+  const preset = nodes(app.renderSettings(), node => node.props.className === 'dsmgr-picker-preset' && node.props['aria-label'] === '#0ea5e9')[0];
+  preset.props.onClick();
+  assert.deepEqual(JSON.parse(app.storage.other[COLORS]), [null, '#0ea5e9', null]);
+  const pressed = nodes(app.renderSettings(), node => node.props.className === 'dsmgr-picker-preset' && node.props['aria-pressed'] === true);
+  assert.deepEqual(pressed.map(node => node.props['aria-label']), ['#0ea5e9'], 'the picker stays open and marks the new color');
+  const hex = nodes(app.renderSettings(), node => node.type === 'input' && node.props['aria-label'] === 'Hex')[0];
+  hex.props.onChange({ target: { value: '12345' } });
+  assert.deepEqual(JSON.parse(app.storage.other[COLORS]), [null, '#0ea5e9', null], 'incomplete hex is kept as a draft');
+  hex.props.onChange({ target: { value: '123456' } });
   assert.deepEqual(JSON.parse(app.storage.other[COLORS]), [null, '#123456', null]);
+  const red = nodes(app.renderSettings(), node => node.type === 'input' && node.props['aria-label'] === 'R')[0];
+  assert.equal(red.props.value, '18');
   assert.deepEqual(app.render().props.style, { '--dsmgr-tone-1': '#123456' });
   const reset = nodes(app.renderSettings(), node => node.type === 'button' && text(node) === 'Reset')[0];
   reset.props.onClick();
@@ -928,4 +946,30 @@ test('rendered pagination grows by five and shift selection excludes hidden sess
   await app.click(row(tree, 'session:extra8'), { shiftKey: true });
   tree = app.render();
   assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:extra9').length, 0);
+});
+
+test('tags: checklist toggles persist, rows show dots, header filter narrows the tree, one-shot tags clear on open', async t => {
+  const app = setup(t);
+  const TAGS = 'dsh.session-manager.tags';
+  const saved = () => JSON.parse(app.storage.other[TAGS]).sessions;
+  const tagMenu = () => nodes(app.render(), node => node.type === 'native-menu' && node.props.anchor === null)[0];
+  const openFor = key => row(app.render(), key).props.onContextMenu(event({ clientX: 1, clientY: 2 }));
+  openFor('session:s1');
+  assert.deepEqual(tagMenu().props.items.filter(item => item.id && !item.type).map(item => item.id).slice(0, 2), ['todo', 'revisit']);
+  tagMenu().props.onSelect('todo');
+  tagMenu().props.onSelect('revisit');
+  assert.deepEqual(saved(), { s1: ['todo', 'revisit'] });
+  assert.deepEqual(tagMenu().props.selectedIds, ['todo', 'revisit']);
+  tagMenu().props.onClose();
+  let tree = app.render();
+  assert.equal(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-tag-dot').length, 2);
+  assert.equal(nodes(row(tree, 'session:s2'), node => node.props.className === 'dsmgr-tags').length, 0);
+  const filter = nodes(tree, node => node.type === 'native-menu' && node.props.anchor?.props['aria-label'] === 'Filter by tag')[0];
+  filter.props.onSelect('todo');
+  tree = app.render();
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:s2').length, 0);
+  assert.ok(nodes(tree, node => node.props.className === 'dsmgr-filter-chip').length);
+  await app.click(row(tree, 'session:s1'));
+  assert.deepEqual(saved(), { s1: ['todo'] });
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's1']);
 });

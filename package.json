@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-manager",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "private": true,
   "type": "module",
   "description": "UI-only nested session folders for DSH workspaces.",

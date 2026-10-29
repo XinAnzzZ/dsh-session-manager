@@ -167,7 +167,8 @@ function folderSessionIds(state, id) {
   return Object.entries(state.sessionFolders).filter(([, folderId]) => folders.has(folderId)).map(([sessionId]) => sessionId);
 }
 
-function rowsForWorkspace(state, workspaceId, sessions, { archivedIds = [], pinnedIds = [], showArchived = false } = {}) {
+// only: when set, a filter view — just those sessions, the folders on their paths, all expanded.
+function rowsForWorkspace(state, workspaceId, sessions, { archivedIds = [], pinnedIds = [], showArchived = false, only = null } = {}) {
   const archived = new Set(archivedIds);
   const pinned = new Set(pinnedIds.filter(id => !archived.has(id)));
   const folders = state.folders.filter(folder => folder.workspaceId === workspaceId);
@@ -177,9 +178,11 @@ function rowsForWorkspace(state, workspaceId, sessions, { archivedIds = [], pinn
     if (!children.has(parentId)) children.set(parentId, []);
     children.get(parentId).push(row);
   };
-  for (const folder of folders) add(folder.parentId, { ...folder, kind: 'folder' });
   const visible = sessions.filter(session => (showArchived || !archived.has(session.id)) &&
-    session.origin !== 'subagent' && !(session.blank && !(session.retainedBy?.mainView > 0)));
+    session.origin !== 'subagent' && !(session.blank && !(session.retainedBy?.mainView > 0)) && (!only || only.has(session.id)));
+  const onPath = new Set();
+  if (only) for (const session of visible) for (const folder of folderChain(state, session.id, workspaceId)) onPath.add(folder.id);
+  for (const folder of folders) if (!only || onPath.has(folder.id)) add(folder.parentId, { ...folder, kind: 'folder' });
   const timestamp = session => typeof session.updatedAt === 'number' ? session.updatedAt : (Date.parse(session.updatedAt) || 0);
   visible.sort((a, b) => Number(pinned.has(b.id)) - Number(pinned.has(a.id)) || timestamp(b) - timestamp(a) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -193,7 +196,7 @@ function rowsForWorkspace(state, workspaceId, sessions, { archivedIds = [], pinn
   while (stack.length) {
     const row = stack.pop();
     rows.push(row);
-    if (row.kind === 'folder' && state.expanded[`folder:${row.id}`] !== false) {
+    if (row.kind === 'folder' && (only || state.expanded[`folder:${row.id}`] !== false)) {
       const nested = children.get(row.id) || [];
       for (let index = nested.length - 1; index >= 0; index--) stack.push({ ...nested[index], depth: row.depth + 1 });
     }
@@ -283,7 +286,61 @@ function treeActivity(state, workspaces, sessions, statuses) {
   return result;
 }
 
+// Session tags live in their own storage key: { version: 1, tags: [{ id, name, color, once }], sessions: { sessionId: [tagId] } }.
+// once: the tag clears itself the next time its session is opened.
+function validateTags(value) {
+  if (!record(value) || value.version !== 1 || !Array.isArray(value.tags) || !record(value.sessions)) throw new Error('Invalid session-tag state');
+  const ids = new Set();
+  for (const tag of value.tags) {
+    if (!record(tag) || !text(tag.id) || ids.has(tag.id) || !text(tag.name) || tag.name.trim().length > 40 ||
+        !/^#[0-9a-f]{6}$/i.test(tag.color) || typeof tag.once !== 'boolean') throw new Error('Invalid or duplicate tag');
+    ids.add(tag.id);
+  }
+  for (const [id, list] of Object.entries(value.sessions)) {
+    if (!text(id) || !Array.isArray(list) || !list.length || new Set(list).size !== list.length || list.some(tagId => !ids.has(tagId))) {
+      throw new Error('Invalid session-tag mapping');
+    }
+  }
+  return value;
+}
+
+function saveTag(state, { id, name, color, once }) {
+  requireText(id, 'Tag id');
+  requireText(name, 'Tag name');
+  if (name.trim().length > 40) throw new Error('Tag name must be at most 40 characters');
+  if (state.tags.some(tag => tag.id !== id && tag.name.toLowerCase() === name.trim().toLowerCase())) throw new Error(`Duplicate tag: ${name.trim()}`);
+  const tag = { id, name: name.trim(), color, once };
+  const tags = state.tags.some(item => item.id === id) ? state.tags.map(item => item.id === id ? tag : item) : [...state.tags, tag];
+  return validateTags({ ...state, tags });
+}
+
+// Rewrites each session's tag list; sessions left without tags are dropped from the mapping.
+function mapSessionTags(state, sessionIds, transform) {
+  const sessions = { ...state.sessions };
+  for (const id of sessionIds) {
+    const list = transform(sessions[id] || []);
+    if (list.length) sessions[id] = list; else delete sessions[id];
+  }
+  return { ...state, sessions };
+}
+
+function deleteTag(state, id) {
+  return mapSessionTags({ ...state, tags: state.tags.filter(tag => tag.id !== id) }, Object.keys(state.sessions), list => list.filter(tagId => tagId !== id));
+}
+
+function setSessionTag(state, sessionIds, tagId, on) {
+  if (!state.tags.some(tag => tag.id === tagId)) throw new Error(`Unknown tag: ${tagId}`);
+  return mapSessionTags(state, sessionIds, list => on ? [...new Set([...list, tagId])] : list.filter(id => id !== tagId));
+}
+
+function clearOnceTags(state, sessionId) {
+  const once = new Set(state.tags.filter(tag => tag.once).map(tag => tag.id));
+  const list = state.sessions[sessionId] || [];
+  return list.some(id => once.has(id)) ? mapSessionTags(state, [sessionId], ids => ids.filter(id => !once.has(id))) : state;
+}
+
 module.exports = {
   initialState, validateState, createFolder, renameFolder, setExpanded, moveItems,
   deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems, sessionActivity, treeActivity, folderChain,
+  validateTags, saveTag, deleteTag, setSessionTag, clearOnceTags,
 };

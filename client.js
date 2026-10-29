@@ -172,7 +172,8 @@ function folderSessionIds(state, id) {
   return Object.entries(state.sessionFolders).filter(([, folderId]) => folders.has(folderId)).map(([sessionId]) => sessionId);
 }
 
-function rowsForWorkspace(state, workspaceId, sessions, { archivedIds = [], pinnedIds = [], showArchived = false } = {}) {
+// only: when set, a filter view — just those sessions, the folders on their paths, all expanded.
+function rowsForWorkspace(state, workspaceId, sessions, { archivedIds = [], pinnedIds = [], showArchived = false, only = null } = {}) {
   const archived = new Set(archivedIds);
   const pinned = new Set(pinnedIds.filter(id => !archived.has(id)));
   const folders = state.folders.filter(folder => folder.workspaceId === workspaceId);
@@ -182,9 +183,11 @@ function rowsForWorkspace(state, workspaceId, sessions, { archivedIds = [], pinn
     if (!children.has(parentId)) children.set(parentId, []);
     children.get(parentId).push(row);
   };
-  for (const folder of folders) add(folder.parentId, { ...folder, kind: 'folder' });
   const visible = sessions.filter(session => (showArchived || !archived.has(session.id)) &&
-    session.origin !== 'subagent' && !(session.blank && !(session.retainedBy?.mainView > 0)));
+    session.origin !== 'subagent' && !(session.blank && !(session.retainedBy?.mainView > 0)) && (!only || only.has(session.id)));
+  const onPath = new Set();
+  if (only) for (const session of visible) for (const folder of folderChain(state, session.id, workspaceId)) onPath.add(folder.id);
+  for (const folder of folders) if (!only || onPath.has(folder.id)) add(folder.parentId, { ...folder, kind: 'folder' });
   const timestamp = session => typeof session.updatedAt === 'number' ? session.updatedAt : (Date.parse(session.updatedAt) || 0);
   visible.sort((a, b) => Number(pinned.has(b.id)) - Number(pinned.has(a.id)) || timestamp(b) - timestamp(a) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -198,7 +201,7 @@ function rowsForWorkspace(state, workspaceId, sessions, { archivedIds = [], pinn
   while (stack.length) {
     const row = stack.pop();
     rows.push(row);
-    if (row.kind === 'folder' && state.expanded[`folder:${row.id}`] !== false) {
+    if (row.kind === 'folder' && (only || state.expanded[`folder:${row.id}`] !== false)) {
       const nested = children.get(row.id) || [];
       for (let index = nested.length - 1; index >= 0; index--) stack.push({ ...nested[index], depth: row.depth + 1 });
     }
@@ -288,9 +291,63 @@ function treeActivity(state, workspaces, sessions, statuses) {
   return result;
 }
 
+// Session tags live in their own storage key: { version: 1, tags: [{ id, name, color, once }], sessions: { sessionId: [tagId] } }.
+// once: the tag clears itself the next time its session is opened.
+function validateTags(value) {
+  if (!record(value) || value.version !== 1 || !Array.isArray(value.tags) || !record(value.sessions)) throw new Error('Invalid session-tag state');
+  const ids = new Set();
+  for (const tag of value.tags) {
+    if (!record(tag) || !text(tag.id) || ids.has(tag.id) || !text(tag.name) || tag.name.trim().length > 40 ||
+        !/^#[0-9a-f]{6}$/i.test(tag.color) || typeof tag.once !== 'boolean') throw new Error('Invalid or duplicate tag');
+    ids.add(tag.id);
+  }
+  for (const [id, list] of Object.entries(value.sessions)) {
+    if (!text(id) || !Array.isArray(list) || !list.length || new Set(list).size !== list.length || list.some(tagId => !ids.has(tagId))) {
+      throw new Error('Invalid session-tag mapping');
+    }
+  }
+  return value;
+}
+
+function saveTag(state, { id, name, color, once }) {
+  requireText(id, 'Tag id');
+  requireText(name, 'Tag name');
+  if (name.trim().length > 40) throw new Error('Tag name must be at most 40 characters');
+  if (state.tags.some(tag => tag.id !== id && tag.name.toLowerCase() === name.trim().toLowerCase())) throw new Error(`Duplicate tag: ${name.trim()}`);
+  const tag = { id, name: name.trim(), color, once };
+  const tags = state.tags.some(item => item.id === id) ? state.tags.map(item => item.id === id ? tag : item) : [...state.tags, tag];
+  return validateTags({ ...state, tags });
+}
+
+// Rewrites each session's tag list; sessions left without tags are dropped from the mapping.
+function mapSessionTags(state, sessionIds, transform) {
+  const sessions = { ...state.sessions };
+  for (const id of sessionIds) {
+    const list = transform(sessions[id] || []);
+    if (list.length) sessions[id] = list; else delete sessions[id];
+  }
+  return { ...state, sessions };
+}
+
+function deleteTag(state, id) {
+  return mapSessionTags({ ...state, tags: state.tags.filter(tag => tag.id !== id) }, Object.keys(state.sessions), list => list.filter(tagId => tagId !== id));
+}
+
+function setSessionTag(state, sessionIds, tagId, on) {
+  if (!state.tags.some(tag => tag.id === tagId)) throw new Error(`Unknown tag: ${tagId}`);
+  return mapSessionTags(state, sessionIds, list => on ? [...new Set([...list, tagId])] : list.filter(id => id !== tagId));
+}
+
+function clearOnceTags(state, sessionId) {
+  const once = new Set(state.tags.filter(tag => tag.once).map(tag => tag.id));
+  const list = state.sessions[sessionId] || [];
+  return list.some(id => once.has(id)) ? mapSessionTags(state, [sessionId], ids => ids.filter(id => !once.has(id))) : state;
+}
+
 module.exports = {
   initialState, validateState, createFolder, renameFolder, setExpanded, moveItems,
   deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems, sessionActivity, treeActivity, folderChain,
+  validateTags, saveTag, deleteTag, setSessionTag, clearOnceTags,
 };
 
 },
@@ -415,8 +472,25 @@ module.exports = function createPlugin(React, model, persistence, ui) {
   const KEY = 'dsh.session-manager.v1';
   const MODE_KEY = 'dsh.session-manager.tree-view';
   const COLOR_KEY = 'dsh.session-manager.folder-colors';
+  const TAG_KEY = 'dsh.session-manager.tags';
+  const NEW_TAG = '\0new-tag';
   // Light-theme defaults per nesting level; the stylesheet carries the dark-theme pair.
   const TONES = ['#8b5cf6', '#0d9488', '#db2777'];
+  // Quick picks shared by folder levels and tags; includes both sets of defaults.
+  const PRESETS = ['#ef4444', '#f97316', '#f59e0b', '#eab308', '#84cc16', '#22c55e', '#0d9488', '#06b6d4',
+    '#0ea5e9', '#3b82f6', '#6366f1', '#8b5cf6', '#a855f7', '#db2777', '#f43f5e', '#64748b'];
+  const HEX = /^#[0-9a-f]{6}$/i;
+  const rgbOf = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  const hexOf = (rgb) => '#' + rgb.map((n) => Math.round(n).toString(16).padStart(2, '0')).join('');
+  function hsvOf(hex) {
+    const [r, g, b] = rgbOf(hex).map((n) => n / 255), max = Math.max(r, g, b), d = max - Math.min(r, g, b);
+    const h = d === 0 ? 0 : max === r ? ((g - b) / d + 6) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    return { h: h * 60, s: max ? d / max : 0, v: max };
+  }
+  function hexOfHsv({ h, s, v }) {
+    const f = (n) => { const k = (n + h / 60) % 6; return 255 * (v - v * s * Math.max(0, Math.min(k, 4 - k, 1))); };
+    return hexOf([f(5), f(3), f(1)]);
+  }
   const NS = 'dsh-session-manager';
   const dictionaries = {
     zh: {
@@ -438,6 +512,13 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       treeView: '使用树状列表', viewDescription: '关闭后使用原生列表，文件夹分组数据保留。', running: '运行中', pending: '等待处理', unread: '完成未读',
       folderColors: '文件夹颜色', folderColorsDescription: '从左到右对应第 1、2、3 级，更深层级循环使用。默认颜色随深浅色主题调整，自定义后两种主题使用同一颜色。',
       level: '第 {n} 级', resetColors: '恢复默认', jump: '{label} {n} 个，查看',
+      defaultReview: '待回看', tagsMenu: '标签…', newTag: '新建标签…', newTagTitle: '新建标签', tagName: '标签名称', tagColor: '标签颜色',
+      tagOnce: '从侧栏打开会话后自动清除此标签', onceBadge: '一次性', filterTags: '按标签筛选', clearFilter: '清除标签筛选',
+      noTags: '暂无标签，可在会话的「更多操作」中新建', noTagged: '没有带此标签的会话', tagSettings: '会话标签',
+      tagSettingsDescription: '在会话的「更多操作」或右键菜单中添加标签，多选后可批量添加；一次性标签在从侧栏打开会话后自动清除。',
+      editTag: '编辑标签', deleteTag: '删除标签', deleteTagMessage: '将删除标签「{name}」，并从 {n} 个会话移除。', tagUsage: '{n} 个会话',
+      tagStorageError: '标签数据无法读取，已停止写入以免覆盖已保存数据。',
+      presetColors: '标准色', eyedropper: '吸取屏幕颜色', hue: '色相',
     },
     en: {
       summary: 'Includes subfolders', workspaceSummary: 'Includes all folders in this workspace', totalSummary: 'All workspaces, including ungrouped', total: 'Unarchived sessions', idle: 'Idle',
@@ -458,6 +539,13 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       treeView: 'Use tree view', viewDescription: 'Turn off to use the native list. Folder assignments are retained.', running: 'Running', pending: 'Needs attention', unread: 'Unread completion',
       folderColors: 'Folder colors', folderColorsDescription: 'Levels 1, 2 and 3 from left to right; deeper levels repeat the cycle. Defaults adapt to light and dark themes; a custom color applies to both.',
       level: 'Level {n}', resetColors: 'Reset', jump: '{label}: {n}, show',
+      defaultReview: 'Revisit', tagsMenu: 'Tags…', newTag: 'New tag…', newTagTitle: 'New tag', tagName: 'Tag name', tagColor: 'Tag color',
+      tagOnce: 'Clear this tag when the session is opened from the sidebar', onceBadge: 'One-shot', filterTags: 'Filter by tag', clearFilter: 'Clear tag filter',
+      noTags: 'No tags yet. Create one from a session\'s More actions menu.', noTagged: 'No sessions with this tag', tagSettings: 'Session tags',
+      tagSettingsDescription: 'Add tags from a session\'s More actions or context menu, or to several selected sessions at once. One-shot tags clear when the session is opened from the sidebar.',
+      editTag: 'Edit tag', deleteTag: 'Delete tag', deleteTagMessage: 'Delete tag "{name}" and remove it from {n} sessions.', tagUsage: '{n} sessions',
+      tagStorageError: 'Tag data could not be read. Writes are paused so saved data is not overwritten.',
+      presetColors: 'Standard colors', eyedropper: 'Pick a color from the screen', hue: 'Hue',
     },
   };
   const workspaceKey = (id) => 'workspace:' + JSON.stringify(id);
@@ -496,6 +584,58 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       kind === 'running' ? h(ui.StateDot, { state: 'ongoing', size: 14 }) : icon(kind === 'pending' ? 'WarningOutline' : 'CheckCircleOutline', { size: 14 }),
       h('span', null, count)) });
   }
+  // Swatch button + popover: standard colors first, then saturation/value square, hue, optional eyedropper, RGB/Hex.
+  // Every adjustment is reported through onChange immediately, so the tree previews while dragging.
+  function ColorPicker({ value, label, t, onChange, className = 'dsmgr-color' }) {
+    const [open, setOpen] = React.useState(false), [hsv, setHsv] = React.useState(() => hsvOf(value));
+    const [text, setText] = React.useState(null);
+    const hex = hexOfHsv(hsv);
+    const pick = (next, keepText = false) => { setHsv(hsvOf(next)); if (!keepText) setText(null); onChange(next.toLowerCase()); };
+    const hsvChange = (next) => { setHsv(next); setText(null); onChange(hexOfHsv(next)); };
+    const fields = (color) => ({ hex: color, ...Object.fromEntries(['r', 'g', 'b'].map((key, i) => [key, String(rgbOf(color)[i])])) });
+    const shown = text || fields(hex);
+    // The edited field keeps the user's draft; the other fields follow once the value is valid.
+    const edit = (key, raw) => {
+      const next = { ...shown, [key]: raw };
+      const candidate = key === 'hex' ? (raw.startsWith('#') ? raw : '#' + raw)
+        : ['r', 'g', 'b'].every((k) => /^\d{1,3}$/.test(next[k]) && Number(next[k]) <= 255) ? hexOf(['r', 'g', 'b'].map((k) => Number(next[k]))) : '';
+      if (!HEX.test(candidate)) { setText(next); return; }
+      setText({ ...fields(candidate.toLowerCase()), [key]: raw });
+      pick(candidate, true);
+    };
+    const drag = (event) => {
+      if (event.type !== 'pointerdown' && !event.buttons) return;
+      if (event.type === 'pointerdown') event.currentTarget.setPointerCapture?.(event.pointerId);
+      const rect = event.currentTarget.getBoundingClientRect(), clamp = (n) => Math.min(1, Math.max(0, n));
+      hsvChange({ h: hsv.h, s: clamp((event.clientX - rect.left) / rect.width), v: clamp(1 - (event.clientY - rect.top) / rect.height) });
+    };
+    const sample = () => new window.EyeDropper().open().then((result) => pick(result.sRGBHex),
+      (error) => { if (error?.name !== 'AbortError') console.error('DSH Session Manager:', error); });
+    const field = (key, name, size) => h('label', { key, className: 'dsmgr-picker-field' },
+      h('input', { value: shown[key], size, spellCheck: false, 'aria-label': name, onChange: (event) => edit(key, event.target.value.trim()), onBlur: () => setText(null) }), name);
+    return h(ui.Menu, { open, onClose: () => setOpen(false), portal: true, align: 'start', listClassName: 'dsmgr-picker',
+      anchor: h('button', { type: 'button', className, title: label + ' ' + value, 'aria-label': label, 'aria-haspopup': 'menu', 'aria-expanded': open,
+        style: { background: value }, onClick: (event) => { event.stopPropagation(); if (!open) { setHsv(hsvOf(value)); setText(null); } setOpen(!open); } }) },
+      // The native menu walks its buttons on ArrowUp/Down/Home/End; keep those keys for the text and range inputs.
+      open && h('div', { className: 'dsmgr-picker-panel', onKeyDown: (event) => { if (event.target.tagName === 'INPUT') event.stopPropagation(); } },
+        h('div', { className: 'dsmgr-picker-presets', role: 'group', 'aria-label': t('presetColors') }, PRESETS.map((color) => h('button', {
+          key: color, type: 'button', className: 'dsmgr-picker-preset', style: { background: color }, title: color, 'aria-label': color,
+          'aria-pressed': color === value.toLowerCase(), onClick: () => pick(color) }))),
+        h('div', { className: 'dsmgr-picker-sv', style: { backgroundColor: hexOfHsv({ h: hsv.h, s: 1, v: 1 }) },
+          onPointerDown: drag, onPointerMove: drag },
+          h('span', { className: 'dsmgr-picker-thumb', style: { left: hsv.s * 100 + '%', top: (1 - hsv.v) * 100 + '%' } })),
+        h('div', { className: 'dsmgr-picker-row' },
+          typeof window.EyeDropper === 'function' && h('button', { type: 'button', className: 'dsmgr-icon-button', title: t('eyedropper'),
+            'aria-label': t('eyedropper'), onClick: sample },
+            // The native icon set has no eyedropper; InspectOutline reads as "</>".
+            // Pipette glyph adapted from Lucide (ISC).
+            h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+              h('path', { d: 'm2 22 1-1h3l9-9M3 21v-3l9-9m3-3 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z' }))),
+          h('span', { className: 'dsmgr-picker-preview', style: { background: hex } }),
+          h('input', { type: 'range', className: 'dsmgr-picker-hue', min: 0, max: 359, value: Math.round(hsv.h), 'aria-label': t('hue'),
+            onChange: (event) => hsvChange({ ...hsv, h: Number(event.target.value) }) })),
+        h('div', { className: 'dsmgr-picker-row' }, field('r', 'R', 3), field('g', 'G', 3), field('b', 'B', 3), field('hex', 'Hex', 7))));
+  }
   function Dialog({ title, children, footer, onClose, closeLabel }) {
     return h(ui.Modal, { open: true, title, onClose, closeLabel, footer }, children);
   }
@@ -513,6 +653,48 @@ module.exports = function createPlugin(React, model, persistence, ui) {
       onChange: (event) => { setName(event.target.value); setError(''); }, onKeyDown: (event) => {
         if (event.key === 'Enter' && (event.nativeEvent?.isComposing || event.keyCode === 229)) event.preventDefault();
       } })), error && h('p', { className: 'dsmgr-name-error', role: 'alert' }, error));
+  }
+  const tagDot = (tag) => h('span', { key: tag.id, className: 'dsmgr-tag-dot', style: { background: tag.color } });
+  const tagLabel = (tag, count) => h('span', { className: 'dsmgr-tag-item' }, tagDot(tag), tag.name,
+    count !== undefined && h('span', { className: 'dsmgr-tag-count' }, count));
+  // Checklist of every tag for the target sessions; stays open so several tags can be toggled in one go.
+  function TagMenu({ tags, ids, rect, t, onToggle, onNew, onClose }) {
+    const all = tags.tags.filter((tag) => ids.every((id) => tags.sessions[id]?.includes(tag.id))).map((tag) => tag.id);
+    return h(ui.Menu, { open: true, portal: true, align: 'start', anchor: null, getAnchorRect: () => rect, onClose,
+      selectedIds: all, selection: 'check',
+      items: [...tags.tags.map((tag) => ({ id: tag.id, label: tagLabel(tag) })), ...(tags.tags.length ? [{ type: 'separator' }] : []),
+        { id: NEW_TAG, label: t('newTag'), icon: icon('PlusOutline') }],
+      onSelect: (id) => id === NEW_TAG ? onNew() : onToggle(id, !all.includes(id)) });
+  }
+  // Header filter: each tag with its session count; picking the active tag again clears the filter.
+  function TagFilter({ tags, active, t, onPick }) {
+    const [open, setOpen] = React.useState(false);
+    const count = (id) => Object.values(tags.sessions).filter((list) => list.includes(id)).length;
+    return h(ui.Menu, { open, onClose: () => setOpen(false), portal: true, align: 'end', selectedId: active, selection: 'check',
+      items: tags.tags.length ? tags.tags.map((tag) => ({ id: tag.id, label: tagLabel(tag, count(tag.id)) }))
+        : [{ type: 'label', id: 'empty', text: t('noTags') }],
+      onSelect: (id) => { setOpen(false); onPick(id); },
+      anchor: h('button', { type: 'button', className: 'dsmgr-icon-button', title: t('filterTags'), 'aria-label': t('filterTags'),
+        'aria-haspopup': 'menu', 'aria-expanded': open, 'data-active': active ? true : undefined,
+        onClick: (event) => { event.stopPropagation(); setOpen(!open); } }, icon('SlidersTwoOutline')) });
+  }
+  function TagDialog({ title, initial = {}, t, onSave, onClose }) {
+    const [name, setName] = React.useState(initial.name || ''), [color, setColor] = React.useState(initial.color || '#6366f1');
+    const [once, setOnce] = React.useState(initial.once === true), [error, setError] = React.useState('');
+    return h(Dialog, { title, onClose, closeLabel: t('close'), footer: [
+      h(ui.Button, { key: 'cancel', variant: 'outline', type: 'button', onClick: onClose }, t('cancel')),
+      h(ui.Button, { key: 'save', variant: 'primary', type: 'submit', form: 'dsmgr-tag-form', disabled: !name.trim() }, t('save')),
+    ] }, h('form', { id: 'dsmgr-tag-form', className: 'dsmgr-tag-form', onSubmit: (event) => {
+      event.preventDefault(); if (!name.trim()) return;
+      try { onSave({ name: name.trim(), color, once }); onClose(); } catch (reason) { console.error('DSH Session Manager:', reason); setError(reason.message); }
+    } }, h('div', { className: 'dsmgr-tag-fields' },
+      h(ui.Input, { className: 'dsmgr-name-input', 'aria-label': t('tagName'), placeholder: t('tagName'), 'data-modal-autofocus': true,
+        value: name, maxLength: 40, onChange: (event) => { setName(event.target.value); setError(''); }, onKeyDown: (event) => {
+          if (event.key === 'Enter' && (event.nativeEvent?.isComposing || event.keyCode === 229)) event.preventDefault();
+        } }),
+      h(ColorPicker, { value: color, label: t('tagColor'), t, onChange: setColor, className: 'dsmgr-color dsmgr-color-large' })),
+    h(ui.Checkbox, { checked: once, label: t('tagOnce'), onChange: setOnce })),
+    error && h('p', { className: 'dsmgr-name-error', role: 'alert' }, error));
   }
   return {
     inject: ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'locale'],
@@ -544,6 +726,31 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         } catch (error) { report(error); setColors([null, null, null]); }
       }
       readColors();
+      // Session tags. Absent key = first run, so the default tags appear; deleting one persists the remaining list.
+      // An unreadable value pauses writes (tagError) instead of overwriting what the user saved.
+      const defaultTags = () => ({ version: 1, sessions: {}, tags: [
+        { id: 'todo', name: 'TODO', color: '#6366f1', once: false },
+        { id: 'revisit', name: t('defaultReview'), color: '#0ea5e9', once: true },
+      ] });
+      let tags = defaultTags(), tagError = null;
+      const tagListeners = new Set();
+      const tagSource = { subscribe: (listener) => { tagListeners.add(listener); return () => tagListeners.delete(listener); },
+        getSnapshot: () => tags };
+      const publishTags = (next) => { tags = next; for (const listener of tagListeners) listener(); };
+      function readTags() {
+        try {
+          const raw = window.localStorage.getItem(TAG_KEY);
+          tagError = null; publishTags(raw === null ? defaultTags() : model.validateTags(JSON.parse(raw)));
+        } catch (error) { report(error); tagError = error; publishTags({ version: 1, tags: [], sessions: {} }); }
+      }
+      function changeTags(transform) {
+        if (tagError) throw new Error(t('tagStorageError'));
+        const next = model.validateTags(transform(tags));
+        if (next === tags) return;
+        window.localStorage.setItem(TAG_KEY, JSON.stringify(next));
+        publishTags(next);
+      }
+      readTags();
       // shortcut: native dialog callbacks are introspected in 0.2.1-rc.2; use a public action API when DSH exposes one.
       function discover() {
         const native = ctx.slots.entries('sidebar.workspaces').find((entry) => (entry.options?.priority ?? 0) === 0 && entry.inject);
@@ -561,6 +768,8 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         const [dialog, setDialog] = React.useState(null), [toast, setToast] = React.useState(null);
         const [dropTarget, setDropTarget] = React.useState(null), toastId = React.useRef(0);
         const colors = useSource(colorSource), [menuAt, setMenuAt] = React.useState(null);
+        const tags = useSource(tagSource), [tagMenu, setTagMenu] = React.useState(null), [tagFilter, setTagFilter] = React.useState(null);
+        const filterTag = tags.tags.find((tag) => tag.id === tagFilter) || null;
         // Each message remounts the native Toast so repeated text restarts its hold timer.
         const setMessage = (text) => setToast({ id: ++toastId.current, text });
         const [busy, setBusy] = React.useState(false), [showArchived, setShowArchived] = React.useState(false);
@@ -595,8 +804,14 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           const status = statuses.get(row.id);
           return row.retainedBy?.mainView > 0 || (status?.running ?? row.running) || status?.pendingInteraction || status?.completionUnread;
         };
-        const groupsWithRows = groups.map((group) => ({ ...group, rows: model.pageRows(model.rowsForWorkspace(state, group.workspaceId,
-          group.sessionIds.map((id) => sessions.byId[id]).filter(Boolean), { archivedIds: [...archived], pinnedIds: [...pinned], showArchived }), limits[group.workspaceId], attention) }));
+        // A tag filter shows only tagged sessions plus the folders on their paths, fully expanded and unpaged.
+        const only = filterTag ? new Set(Object.keys(tags.sessions).filter((id) => tags.sessions[id].includes(filterTag.id))) : null;
+        const groupsWithRows = groups.map((group) => {
+          const rows = model.rowsForWorkspace(state, group.workspaceId, group.sessionIds.map((id) => sessions.byId[id]).filter(Boolean),
+            { archivedIds: [...archived], pinnedIds: [...pinned], showArchived, only });
+          return { ...group, rows: only ? rows : model.pageRows(rows, limits[group.workspaceId], attention) };
+        }).filter((group) => !only || group.rows.length);
+        const workspaceOpen = (group) => only !== null || state.expanded[workspaceKey(group.workspaceId)] !== false;
         const matches = new Map();
         const include = (session, group, snippet) => {
           if (!session || session.blank || session.origin === 'subagent' || (!showArchived && archived.has(session.id))) return;
@@ -613,7 +828,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           if (remote.query === q) for (const hit of remote.items) include(sessions.byId[hit.sessionId],
             groups.find((group) => group.sessionIds.includes(hit.sessionId)) || groups.at(-1), hit.snippet);
         }
-        const visible = q ? [...matches.values()].slice(0, 20) : groupsWithRows.flatMap((group) => state.expanded[workspaceKey(group.workspaceId)] === false ? [] : group.rows.filter((row) => row.kind !== 'overflow'));
+        const visible = q ? [...matches.values()].slice(0, 20) : groupsWithRows.flatMap((group) => !workspaceOpen(group) ? [] : group.rows.filter((row) => row.kind !== 'overflow'));
         const keyOf = (row) => row.kind + ':' + row.id;
         const chosen = new Set(selection.selection);
         const safe = (action) => async () => {
@@ -662,6 +877,24 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           try { change((previous) => model.setExpanded(previous, key, open)); }
           catch (error) { report(error); setMessage(t('failed') + ': ' + error.message); }
         }
+        const tagById = new Map(tags.tags.map((tag) => [tag.id, tag]));
+        const sessionTags = (id) => (tags.sessions[id] || []).map((tagId) => tagById.get(tagId)).filter(Boolean);
+        function editTags(transform) {
+          try { changeTags(transform); } catch (error) { report(error); setMessage(t('failed') + ': ' + error.message); }
+        }
+        // Opening a session from the sidebar consumes its one-shot tags.
+        function openFromSidebar(id) {
+          if (sessionTags(id).some((tag) => tag.once)) editTags((previous) => model.clearOnceTags(previous, id));
+          Promise.resolve().then(() => ctx.uiWorkspace.openSession(id)).catch((error) => { report(error); setMessage(t('failed') + ': ' + error.message); });
+        }
+        // Tags target the whole multi-selection when the row is part of it; the checklist opens at the cursor or under the row.
+        function openTags(row, point) {
+          const key = keyOf(row);
+          const ids = chosen.size > 1 && chosen.has(key) ? [...chosen].filter((item) => item.startsWith('session:')).map((item) => item.slice(8)) : [row.id];
+          const r = point ? { left: point.x, right: point.x, top: point.y, bottom: point.y }
+            : rootRef.current?.querySelector('[data-dsm-key=' + JSON.stringify(key) + ']')?.getBoundingClientRect() ?? null;
+          setTagMenu({ ids, rect: r ? { left: r.left, right: r.right, top: r.top, bottom: r.bottom } : { left: 0, right: 0, top: 0, bottom: 0 } });
+        }
         React.useEffect(() => {
           const listener = (event) => {
             if (event.storageArea !== window.localStorage || (event.key !== KEY && event.key !== null)) return;
@@ -692,7 +925,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           try { change((previous) => keys.reduce((next, key) => next.expanded[key] === false ? model.setExpanded(next, key, true) : next, previous)); }
           catch (error) { report(error); setMessage(t('failed') + ': ' + error.message); }
           setReveal({ id });
-          Promise.resolve().then(() => ctx.uiWorkspace.openSession(id)).catch((error) => { report(error); setMessage(t('failed') + ': ' + error.message); });
+          openFromSidebar(id);
         }
         // scope: dictionary key describing what the counts cover; folderId trims the location to paths below that folder.
         function activitySummary(counts, scope, { folderId = null, withWorkspace = false } = {}) {
@@ -725,6 +958,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           const title = folder ? row.name : row.displayTitle || row.title || t('session');
           const time = !folder && !row.blank ? ui.relativeTime(row.updatedAt, Date.now()) : null;
           const timeText = time && t('time.' + time.unit, { n: time.n });
+          const rowTags = folder ? [] : sessionTags(row.id);
           const restoreSession = safe(async () => { await ctx.uiWorkspace.unarchiveSession(row.id); setMessage(t('restored')); });
           // A lone click selects too; only a real multi-selection gets its own fill, the current session keeps the hover fill.
           const element = h('div', { key, role: 'treeitem', tabIndex: 0, className: 'dsmgr-row' + (chosen.size > 1 && chosen.has(key) ? ' dsmgr-selected' : ''),
@@ -736,14 +970,18 @@ module.exports = function createPlugin(React, model, persistence, ui) {
             style: { paddingLeft: 8 + 20 * (row.depth + (folder ? 1 : 0)) },
             'data-kind': row.kind, 'data-archived': !folder && row.archived || undefined,
             ...(folder ? dropProps(key, row.workspaceId, row.id) : {}),
-            onContextMenu: folder ? (event) => { event.preventDefault(); event.stopPropagation(); setMenuAt({ key, x: event.clientX, y: event.clientY }); } : undefined,
+            onContextMenu: (event) => {
+              if (!folder && (row.blank || row.archived)) return;
+              event.preventDefault(); event.stopPropagation();
+              if (folder) setMenuAt({ key, x: event.clientX, y: event.clientY }); else openTags(row, { x: event.clientX, y: event.clientY });
+            },
             onClick: (event) => {
               select(event, row);
               if (event.ctrlKey || event.metaKey || event.shiftKey) return;
               if (folder && event.detail < 2) toggle('folder:' + row.id, !expanded);
               else if (!folder) {
                 if (row.archived) setMessage(t('restoreFirst'));
-                else Promise.resolve().then(() => ctx.uiWorkspace.openSession(row.id)).catch(error => { report(error); setMessage(t('failed') + ': ' + error.message); });
+                else openFromSidebar(row.id);
               }
             },
             onDoubleClick: (event) => { event.stopPropagation(); if (!event.ctrlKey && !event.shiftKey && !event.metaKey) rename(row); },
@@ -761,6 +999,9 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           folder ? h('span', { className: 'dsmgr-label', title }, title)
             : h('span', { className: 'dsmgr-label' }, title),
           folder && activitySummary(activity.folders.get(row.id), 'summary', { folderId: row.id }),
+          // Up to two color dots, then "+n"; names are in the row hover card.
+          !folder && rowTags.length > 0 && h('span', { className: 'dsmgr-tags', 'aria-label': rowTags.map((tag) => tag.name).join(', ') },
+            rowTags.slice(0, 2).map(tagDot), rowTags.length > 2 && h('span', { className: 'dsmgr-tag-more' }, '+' + (rowTags.length - 2))),
           timeText && h('span', { className: 'dsmgr-time' }, timeText),
           !folder && !row.archived && pinned.has(row.id) && h('span', { className: 'dsmgr-pin', 'aria-label': t('pin'), title: t('pin') }, icon('PinFill', { size: 14 })),
           h('span', { className: 'dsmgr-actions', onClick: (event) => event.stopPropagation(), onDoubleClick: (event) => event.stopPropagation(), draggable: false,
@@ -775,6 +1016,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           ] : [
             item('pin', pinned.has(row.id) ? t('unpin') : t('pin'), 'PinOutline', safe(() => pinned.has(row.id) ? ctx.uiWorkspace.unpinSession(row.id) : ctx.uiWorkspace.pinSession(row.id))),
             item('rename', t('rename'), 'EditOutline', () => rename(row), row.blank),
+            item('tags', t('tagsMenu'), 'ChecklistOutline', () => openTags(row), row.blank),
             item('archive', t('archive'), 'ArchiveOutline', safe(() => adapter.archive(row.id)), row.blank),
           ] }),
           folder && iconButton(t('session'), 'NewChatOutline', safe(() => newSession(row.workspaceId, row.id)), !row.workspaceId),
@@ -785,6 +1027,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           // Native session rows show the full title and age in a hover card anchored on the whole row.
           return h(ui.HoverCard, { key, anchor: element, content: h('div', { className: 'dsmgr-hover' },
             h('div', { className: 'dsmgr-hover-title' }, title),
+            rowTags.length > 0 && h('div', { className: 'dsmgr-hover-tags' }, rowTags.map((tag) => h('span', { key: tag.id }, tagLabel(tag)))),
             timeText && h('div', { className: 'dsmgr-hover-time' }, time.unit === 'now' ? timeText : t('time.ago', { t: timeText }))) });
         }
         async function removeFolder(archive) {
@@ -816,8 +1059,12 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         if (!wide) return h('button', { type: 'button', className: 'dsmgr-expand', title: t('title'), onClick: expandSidebar }, h(FolderIcon, {}));
         return h('section', { className: 'dsmgr', ref: rootRef, onKeyDown: keyboard, 'aria-label': t('title'),
           style: Object.fromEntries(colors.flatMap((color, index) => color ? [['--dsmgr-tone-' + index, color]] : [])) },
-          h('style', null, styles), h('header', null, !searchOpen && h('span', { className: 'dsmgr-heading' }, t('workspace')),
-            !searchOpen && activitySummary(activity.total, 'totalSummary', { withWorkspace: true }),
+          h('style', null, styles), h('header', null, !searchOpen && h('span', { className: 'dsmgr-heading' }, filterTag
+              ? h('span', { className: 'dsmgr-filter-chip' }, tagDot(filterTag), h('span', { className: 'dsmgr-filter-name' }, filterTag.name),
+                iconButton(t('clearFilter'), 'CloseOutline', () => setTagFilter(null)))
+              : t('workspace')),
+            !searchOpen && !filterTag && activitySummary(activity.total, 'totalSummary', { withWorkspace: true }),
+            !searchOpen && h(TagFilter, { tags, active: tagFilter, t, onPick: (id) => setTagFilter((current) => current === id ? null : id) }),
             searchOpen ? h('div', { className: 'dsmgr-search' }, icon('SearchOutline'),
               h('input', { ref: searchRef, type: 'text', value: query, maxLength: 500, 'aria-label': t('search'), placeholder: t('search'),
                 onChange: (event) => { const value = event.target.value.replaceAll('\0', '');
@@ -840,8 +1087,9 @@ module.exports = function createPlugin(React, model, persistence, ui) {
               remote.query === q && remote.loading && h('p', { role: 'status', className: 'dsmgr-hint' }, t('loading')),
               !matches.size && !(remote.query === q && remote.loading) && h('p', { className: 'dsmgr-hint' }, t('noMatches')),
               (matches.size > 20 || remote.query === q && remote.hasMore) && h('p', { className: 'dsmgr-hint' }, t('refineSearch')))
+              : only && !groupsWithRows.length ? h('p', { className: 'dsmgr-hint' }, t('noTagged'))
               : groupsWithRows.filter((group) => group.workspaceId || group.rows.length).map((group) => {
-              const open = state.expanded[workspaceKey(group.workspaceId)] !== false;
+              const open = workspaceOpen(group);
               return h('div', { key: group.workspaceId }, h('div', { role: 'treeitem', 'aria-level': 1, 'aria-expanded': open,
                 tabIndex: 0, className: 'dsmgr-row dsmgr-workspace', title: group.path,
                 onClick: () => toggle(workspaceKey(group.workspaceId), !open),
@@ -859,7 +1107,13 @@ module.exports = function createPlugin(React, model, persistence, ui) {
               open && group.rows.map(rowView), open && group.rows.length === 0 && h('p', { className: 'dsmgr-hint' }, t('empty')));
             })),
           toast && h(ui.Toast, { key: toast.id, text: toast.text, onDone: () => setToast((current) => current?.id === toast.id ? null : current) }),
-          dialog && (dialog.type === 'delete' ? h(Dialog, { title: t('remove'), closeLabel: t('close'), onClose: () => !busy && setDialog(null), footer: [
+          tagMenu && h(TagMenu, { tags, ids: tagMenu.ids, rect: tagMenu.rect, t, onClose: () => setTagMenu(null),
+            onToggle: (tagId, on) => editTags((previous) => model.setSessionTag(previous, tagMenu.ids, tagId, on)),
+            onNew: () => { setTagMenu(null); setDialog({ type: 'tag', ids: tagMenu.ids }); } }),
+          dialog && (dialog.type === 'tag' ? h(TagDialog, { key: 'tag', title: t('newTagTitle'), t, onClose: () => setDialog(null),
+            onSave: (tag) => { const id = crypto.randomUUID();
+              changeTags((previous) => model.setSessionTag(model.saveTag(previous, { id, ...tag }), dialog.ids, id, true)); } })
+            : dialog.type === 'delete' ? h(Dialog, { title: t('remove'), closeLabel: t('close'), onClose: () => !busy && setDialog(null), footer: [
             h(ui.Button, { key: 'cancel', variant: 'outline', type: 'button', disabled: busy, onClick: () => setDialog(null) }, t('cancel')),
             h(ui.Button, { key: 'delete', variant: 'primary', type: 'button', className: 'dsmgr-delete-danger', disabled: busy,
               onClick: safe(() => removeFolder(dialog.archive === true)) }, t('delete')),
@@ -925,19 +1179,45 @@ module.exports = function createPlugin(React, model, persistence, ui) {
             h('div', null, h('div', { className: 'dsmgr-setting-title' }, t('folderColors')),
               h('div', { className: 'dsmgr-setting-description' }, t('folderColorsDescription')),
               error && h('div', { role: 'alert', className: 'dsmgr-name-error' }, error)),
-            h('div', { className: 'dsmgr-colors' }, colors.map((color, index) => h('input', {
-              key: index, type: 'color', className: 'dsmgr-color', value: color || TONES[index],
-              'aria-label': t('level', { n: index + 1 }), title: t('level', { n: index + 1 }),
-              onChange: (event) => save(colors.map((value, i) => i === index ? event.target.value : value)),
+            h('div', { className: 'dsmgr-colors' }, colors.map((color, index) => h(ColorPicker, {
+              key: index, value: color || TONES[index], label: t('level', { n: index + 1 }), t,
+              onChange: (next) => save(colors.map((value, i) => i === index ? next : value)),
             })), h(ui.Button, { variant: 'outline', size: 'sm', type: 'button', disabled: colors.every((color) => color === null),
               onClick: () => save([null, null, null]) }, t('resetColors'))));
         }
+        // Tag management: edit name/color/one-shot, delete with the number of sessions it is removed from.
+        function TagSettings() {
+          const tags = useSource(tagSource), [dialog, setDialog] = React.useState(null), [error, setError] = React.useState('');
+          const usage = (id) => Object.values(tags.sessions).filter((list) => list.includes(id)).length;
+          const run = (transform) => {
+            try { changeTags(transform); setError(''); } catch (reason) { report(reason); setError(reason.message); }
+          };
+          return h('div', { className: 'dsmgr-setting dsmgr-setting-block' },
+            h('div', { className: 'dsmgr-setting-title' }, t('tagSettings')),
+            h('div', { className: 'dsmgr-setting-description' }, t('tagSettingsDescription')),
+            (error || tagError) && h('div', { role: 'alert', className: 'dsmgr-name-error' }, error || t('tagStorageError')),
+            h('div', { className: 'dsmgr-tag-list' }, tags.tags.length ? tags.tags.map((tag) => h('div', { key: tag.id, className: 'dsmgr-tag-row' },
+              tagLabel(tag), h('span', { className: 'dsmgr-tag-meta' }, [tag.once && t('onceBadge'), t('tagUsage', { n: usage(tag.id) })].filter(Boolean).join(' · ')),
+              h('button', { type: 'button', className: 'dsmgr-icon-button', title: t('editTag'), 'aria-label': t('editTag'),
+                onClick: () => setDialog({ type: 'edit', tag }) }, icon('EditOutline')),
+              h('button', { type: 'button', className: 'dsmgr-icon-button', title: t('deleteTag'), 'aria-label': t('deleteTag'),
+                onClick: () => setDialog({ type: 'delete', tag }) }, icon('TrashOutline'))))
+              : h('div', { className: 'dsmgr-setting-description' }, t('noTags'))),
+            dialog?.type === 'edit' && h(TagDialog, { key: dialog.tag.id, title: t('editTag'), initial: dialog.tag, t, onClose: () => setDialog(null),
+              onSave: (tag) => changeTags((previous) => model.saveTag(previous, { id: dialog.tag.id, ...tag })) }),
+            dialog?.type === 'delete' && h(Dialog, { title: t('deleteTag'), closeLabel: t('close'), onClose: () => setDialog(null), footer: [
+              h(ui.Button, { key: 'cancel', variant: 'outline', type: 'button', onClick: () => setDialog(null) }, t('cancel')),
+              h(ui.Button, { key: 'delete', variant: 'primary', type: 'button', className: 'dsmgr-delete-danger',
+                onClick: () => { run((previous) => model.deleteTag(previous, dialog.tag.id)); setDialog(null); } }, t('delete')),
+            ] }, h('p', { className: 'dsmgr-delete-message' }, t('deleteTagMessage', { name: dialog.tag.name, n: usage(dialog.tag.id) }))));
+        }
         const disposeSettings = ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section', id: NS, order: 50, locale: NS, label: () => t('title'),
-        }, function SettingsSection() { return h('div', null, h(Settings), h(ColorSettings)); }));
+        }, function SettingsSection() { return h('div', null, h(Settings), h(ColorSettings), h(TagSettings)); }));
         const syncMode = (event) => {
           if (event.storageArea && event.storageArea !== window.localStorage) return;
           if (event.key === null || event.key === COLOR_KEY) readColors();
+          if (event.key === null || event.key === TAG_KEY) readTags();
           if (event.key !== null && event.key !== MODE_KEY) return;
           try {
             nativeMode = window.localStorage.getItem(MODE_KEY) === 'false';
@@ -976,9 +1256,20 @@ const styles = `
 .dsmgr-setting{display:flex;justify-content:space-between;align-items:center;gap:24px;padding:16px 0;border-bottom:.5px solid var(--dsw-alias-border-l2)}.dsmgr-setting-title{font-size:14px;line-height:20px}.dsmgr-setting-description{margin-top:4px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}.dsmgr-colors{display:flex;align-items:center;gap:8px;flex:none}.dsmgr-color{width:28px;height:28px;padding:0;border:.5px solid var(--dsw-alias-border-l4);border-radius:var(--dsw-radius-sm);background:transparent;cursor:pointer}
 .dsmgr-name-input{box-sizing:border-box;width:100%;height:44px;padding:0 14px;border-radius:var(--dsw-radius-lg)}.dsmgr-name-error{color:var(--dsw-alias-state-error-primary);margin-top:8px;font-size:12px;line-height:18px}
 .dsmgr-row[data-archived=true]>.dsmgr-label{color:var(--dsw-alias-label-caption)}
+.dsmgr-tag-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none}.dsmgr-tag-item{display:inline-flex;align-items:center;gap:6px;min-width:0}.dsmgr-tag-count{margin-left:auto;padding-left:12px;font-size:12px;color:var(--dsw-alias-label-tertiary)}
+.dsmgr-tags{display:inline-flex;align-items:center;gap:3px;margin-right:6px;flex:none}.dsmgr-tag-more{font-size:10px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
+.dsmgr-hover-tags{display:flex;flex-wrap:wrap;gap:4px 10px;font-size:12px;line-height:16px;color:#cfd3d6}
+.dsmgr-filter-chip{display:inline-flex;align-items:center;gap:6px;max-width:100%;min-width:0;color:var(--dsw-alias-label-primary)}.dsmgr-filter-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsmgr header .dsmgr-filter-chip .dsmgr-icon-button{width:16px;height:16px}.dsmgr header .dsmgr-icon-button[data-active=true]{color:var(--dsw-alias-state-business-primary)}
+.dsmgr-tag-form{display:flex;flex-direction:column;gap:12px}.dsmgr-tag-fields{display:flex;align-items:center;gap:8px}.dsmgr-tag-fields>:first-child{flex:1;min-width:0}.dsmgr-color-large{width:44px;height:44px;flex:none}
+.dsmgr-picker-panel{display:flex;flex-direction:column;gap:10px;width:224px;padding:8px}.dsmgr-picker-presets{display:grid;grid-template-columns:repeat(8,20px);justify-content:space-between;row-gap:8px}.dsmgr-picker-preset,.dsmgr-picker-preview{width:20px;height:20px;padding:0;border:0;border-radius:50%;flex:none;cursor:pointer;box-shadow:inset 0 0 0 .5px rgba(0,0,0,.15)}.dsmgr-picker-preset[aria-pressed=true]{box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-2),0 0 0 3.5px var(--dsw-alias-state-business-primary)}
+.dsmgr-picker-sv{position:relative;height:140px;border-radius:var(--dsw-radius-sm);background-image:linear-gradient(to top,#000,transparent),linear-gradient(to right,#fff,transparent);cursor:crosshair;touch-action:none}.dsmgr-picker-thumb{position:absolute;box-sizing:border-box;width:12px;height:12px;margin:-6px 0 0 -6px;border:2px solid #fff;border-radius:50%;box-shadow:0 0 0 1px rgba(0,0,0,.3);pointer-events:none}
+.dsmgr-picker-row{display:flex;align-items:center;gap:8px}.dsmgr-picker-preview{cursor:default}.dsmgr-picker-hue{flex:1;min-width:0;height:10px;margin:0;border-radius:5px;appearance:none;background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00);cursor:pointer}.dsmgr-picker-hue::-webkit-slider-thumb{appearance:none;width:14px;height:14px;border:2px solid #fff;border-radius:50%;background:transparent;box-shadow:0 0 0 1px rgba(0,0,0,.3)}
+.dsmgr-picker-field{display:flex;flex-direction:column;align-items:center;gap:2px;flex:1;min-width:0;font-size:11px;line-height:14px;color:var(--dsw-alias-label-tertiary)}.dsmgr-picker-field:last-child{flex:2}.dsmgr-picker-field input{box-sizing:border-box;width:100%;height:24px;padding:0 4px;text-align:center;font:inherit;font-size:12px;color:var(--dsw-alias-label-primary);background:transparent;border:.5px solid var(--dsw-alias-border-l4);border-radius:var(--dsw-radius-xs);outline:none}.dsmgr-picker-field input:focus{border-color:var(--dsw-alias-state-business-primary)}
+.dsmgr-tag-list{display:flex;flex-direction:column;margin-top:8px}.dsmgr-tag-row{display:flex;align-items:center;gap:8px;min-height:32px;font-size:14px;line-height:20px}.dsmgr-tag-row>.dsmgr-tag-item{flex:1}.dsmgr-tag-meta{font-size:12px;color:var(--dsw-alias-label-tertiary);flex:none}.dsmgr-tag-row .dsmgr-icon-button{width:28px;height:28px}
 .dsmgr-search{display:flex;align-items:center;gap:4px;min-width:0;flex:1;color:var(--dsw-alias-label-secondary)}.dsmgr-search input{font:inherit;color:var(--dsw-alias-label-primary);background:transparent;border:0;outline:none;min-width:0;width:100%}.dsmgr-search:focus-within{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));border-radius:var(--dsw-radius-sm)}
 .dsmgr-search-meta{display:flex;gap:6px;margin:0 8px 4px 28px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-tertiary)}.dsmgr-search-meta span{color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsmgr-expand{background:transparent;border:0;color:inherit;cursor:pointer;padding:12px}
+.dsmgr-setting-block{display:block}
 `;
 
 }};
