@@ -152,6 +152,21 @@ function moveItems(state, items, target) {
   };
 }
 
+// Folder order is the order of state.folders among siblings. Moves items next to sibling folder refId (refId null: after
+// the last root folder); dragged folders keep their relative order. Sessions just land in refId's parent.
+function placeItems(state, items, { workspaceId, refId, after = true }) {
+  const ref = refId === null ? null : getFolder(state, refId);
+  if (ref && ref.workspaceId !== workspaceId) throw new Error('Cannot move across workspaces');
+  const parentId = ref ? ref.parentId : null;
+  const ids = new Set(items.filter(item => item.kind === 'folder').map(item => item.id));
+  if (ids.has(refId)) return state;
+  const next = moveItems(state, items, { workspaceId, folderId: parentId });
+  const moved = next.folders.filter(folder => ids.has(folder.id) && folder.parentId === parentId);
+  const rest = next.folders.filter(folder => !moved.includes(folder));
+  const at = ref ? rest.findIndex(folder => folder.id === refId) + (after ? 1 : 0) : rest.length;
+  return { ...next, folders: [...rest.slice(0, at), ...moved, ...rest.slice(at)] };
+}
+
 function deleteFolder(state, id) {
   const removed = subtreeIds(state, id);
   return {
@@ -340,7 +355,7 @@ function clearOnceTags(state, sessionId) {
 }
 
 module.exports = {
-  initialState, validateState, createFolder, renameFolder, setExpanded, moveItems,
+  initialState, validateState, createFolder, renameFolder, setExpanded, moveItems, placeItems,
   deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems, sessionActivity, treeActivity, folderChain,
   validateTags, saveTag, deleteTag, setSessionTag, clearOnceTags,
 };

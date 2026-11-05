@@ -278,13 +278,19 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         publishTags(next);
       }
       // shortcut: native dialog callbacks are introspected in 0.2.1-rc.2; use a public action API when DSH exposes one.
+      // Archive moved out of the session-menu slot in DSH 0.2.2: uiWorkspace owns it now, and the slot entry lives in
+      // sidebar.workspaces.session.row.action. Older shells only publish the menu entry, so fall back to the slot lookup.
       function discover() {
         const native = ctx.slots.entries('sidebar.workspaces').find((entry) => (entry.options?.priority ?? 0) === 0 && entry.inject);
         const face = native?.inject();
-        const archive = ctx.slots.entries('sidebar.workspaces.session.menu.item').find((entry) => entry.options?.id === 'archive')?.inject?.();
-        if (typeof face?.requestSessionRename !== 'function' || typeof archive?.archiveSession !== 'function'
+        const slotArchive = ['sidebar.workspaces.session.row.action', 'sidebar.workspaces.session.menu.item']
+          .map((name) => ctx.slots.entries(name).find((entry) => entry.options?.id === 'archive')?.inject?.())
+          .find((value) => typeof value?.archiveSession === 'function')?.archiveSession;
+        const archive = slotArchive || (typeof ctx.uiWorkspace.archiveSession === 'function'
+          ? ctx.uiWorkspace.archiveSession.bind(ctx.uiWorkspace) : undefined);
+        if (typeof face?.requestSessionRename !== 'function' || typeof archive !== 'function'
           || typeof ctx.sessions.create !== 'function' || typeof ctx.uiWorkspace.openSession !== 'function') return null;
-        return { rename: face.requestSessionRename, archive: archive.archiveSession };
+        return { rename: face.requestSessionRename, archive };
       }
       function Tree({ wide, expandSidebar, useSessionStatus, usePanelInfo }) {
         const state = useSource(store), sessions = useSource(sessionSource), workspaces = useSource(workspaceSource);
@@ -377,27 +383,44 @@ module.exports = function createPlugin(React, model, persistence, ui) {
           if (folderId) change((previous) => model.moveItems(previous, [{ kind: 'session', id, workspaceId }], { workspaceId, folderId }));
           ctx.uiWorkspace.openSession(id);
         }
-        function drop(event, workspaceId, folderId) {
+        function drop(event, transform) {
           event.preventDefault(); event.stopPropagation();
           if (!dragging || busy) return;
           try { const before = store.getSnapshot();
-            change((previous) => model.moveItems(previous, dragging, { workspaceId, folderId }), { drag: true });
+            change(transform, { drag: true });
             setSelection({ selection: [], anchor: null });
             if (store.getSnapshot() !== before) setMessage(t('moved'));
           } catch (error) { report(error); setMessage(t('failed') + ': ' + error.message); }
           dragging = null; setDropTarget(null);
         }
+        // Where a drop lands: workspace rows and session-only drags move into; with folders dragged, a folder row's top/bottom
+        // quarter places them before/after it, and a session row places all-folder drags after the session's parent folder.
+        const zoneOf = (event, folderId, sessionParent) => {
+          const folders = dragging.some((item) => item.kind === 'folder');
+          if (sessionParent !== undefined) return folders && dragging.every((item) => item.kind === 'folder') ? 'after' : null;
+          if (folderId === null || !folders) return 'into';
+          const r = event.currentTarget.getBoundingClientRect(), y = event.clientY - r.top;
+          return y < r.height / 4 ? 'before' : y > r.height * 3 / 4 ? 'after' : 'into';
+        };
         // Rows accept drops only within the dragged items' workspace, matching model.moveItems.
-        const dropProps = (target, workspaceId, folderId) => ({
-          'data-drop-target': dropTarget === target || undefined,
+        const dropProps = (target, workspaceId, { folderId = null, sessionParent } = {}) => ({
+          'data-drop-target': dropTarget?.target === target ? dropTarget.zone : undefined,
           onDragOver: (event) => {
             if (!dragging) return;
             event.stopPropagation();
-            if (!workspaceId || dragging.some((item) => item.workspaceId !== workspaceId)) { event.dataTransfer.dropEffect = 'none'; return; }
-            event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropTarget(target);
+            const zone = zoneOf(event, folderId, sessionParent);
+            if (!zone || !workspaceId || dragging.some((item) => item.workspaceId !== workspaceId)) { event.dataTransfer.dropEffect = 'none'; return; }
+            event.preventDefault(); event.dataTransfer.dropEffect = 'move';
+            setDropTarget((current) => current?.target === target && current.zone === zone ? current : { target, zone });
           },
-          onDragLeave: (event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDropTarget((current) => current === target ? null : current); },
-          onDrop: (event) => drop(event, workspaceId, folderId),
+          onDragLeave: (event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDropTarget((current) => current?.target === target ? null : current); },
+          onDrop: (event) => {
+            if (!dragging) return;
+            const zone = zoneOf(event, folderId, sessionParent);
+            if (!zone) return;
+            drop(event, (previous) => zone === 'into' ? model.moveItems(previous, dragging, { workspaceId, folderId })
+              : model.placeItems(previous, dragging, { workspaceId, refId: sessionParent !== undefined ? sessionParent : folderId, after: zone === 'after' }));
+          },
         });
         function toggle(key, open) {
           try { change((previous) => model.setExpanded(previous, key, open)); }
@@ -499,7 +522,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
             // an empty slot would otherwise push idle titles under the previous subfolder's name.
             style: { paddingLeft: 8 + 20 * (row.depth + (folder ? 1 : 0)) },
             'data-kind': row.kind, 'data-archived': !folder && row.archived || undefined,
-            ...(folder ? dropProps(key, row.workspaceId, row.id) : {}),
+            ...dropProps(key, row.workspaceId, folder ? { folderId: row.id } : { sessionParent: row.parentId }),
             onContextMenu: (event) => {
               if (!folder && (row.blank || row.archived)) return;
               event.preventDefault(); event.stopPropagation();
@@ -623,7 +646,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
               return h('div', { key: group.workspaceId }, h('div', { role: 'treeitem', 'aria-level': 1, 'aria-expanded': open,
                 tabIndex: 0, className: 'dsmgr-row dsmgr-workspace', title: group.path,
                 onClick: () => toggle(workspaceKey(group.workspaceId), !open),
-                ...dropProps(workspaceKey(group.workspaceId), group.workspaceId, null) },
+                ...dropProps(workspaceKey(group.workspaceId), group.workspaceId) },
               // Native project rows swap the folder for a rotating chevron on hover.
               h('span', { className: 'dsmgr-folder-icon dsmgr-workspace-folder' }, icon(open ? 'FolderOpen' : 'FolderClose')),
               h('span', { className: 'dsmgr-folder-icon dsmgr-chevron' }, icon('TriangleRightFill', { className: 'dsmgr-arrow' + (open ? ' dsmgr-arrow-open' : '') })),
@@ -687,6 +710,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         };
         const dispose = ctx.slots.subscribe('sidebar.workspaces', reconcile);
         const disposeMenu = ctx.slots.subscribe('sidebar.workspaces.session.menu.item', reconcile);
+        const disposeRow = ctx.slots.subscribe('sidebar.workspaces.session.row.action', reconcile);
         const shortcuts = ctx.slots.entries('sidebar.workspaces').find((entry) => (entry.options?.priority ?? 0) === 0 && entry.inject)?.inject()?.hooks?.workspaceShortcuts;
         let lastSearchRequest = shortcuts?.getSnapshot().searchRequest;
         const disposeSearch = shortcuts?.subscribe(() => {
@@ -771,7 +795,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         document.addEventListener('visibilitychange', refresh);
         reconcile();
         return () => {
-          dispose(); disposeMenu(); disposeSearch?.(); disposeSettings(); disposeSync();
+          dispose(); disposeMenu(); disposeRow(); disposeSearch?.(); disposeSettings(); disposeSync();
           window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', refresh);
           disposeTree?.(); disposeTree = undefined;
         };
@@ -784,7 +808,7 @@ const styles = `
 .dsmgr{display:flex;flex-direction:column;min-height:0;font:inherit;color:var(--dsw-alias-label-primary);height:100%;padding-right:var(--dsh-sidebar-inline-padding,8px);box-sizing:border-box}
 .dsmgr header{display:flex;align-items:center;gap:4px;height:36px;min-height:36px;margin:2px -4px 4px 0;padding-left:4px;color:var(--dsw-alias-label-tertiary)}.dsmgr-heading{flex:1;font-weight:400}.dsmgr button,.dsmgr-dialog button{font:inherit;cursor:pointer}.dsmgr-tree{min-height:0;overflow:auto;flex:1}.dsmgr-row{box-sizing:border-box;display:flex;align-items:center;gap:6px;height:32px;padding:0 8px;border-radius:var(--dsw-radius-md);cursor:pointer;user-select:none;color:var(--dsw-alias-label-primary);flex-shrink:0}
 .dsmgr-row:hover,.dsmgr-row[aria-current=page]{background:var(--dsw-alias-interactive-bg-hover)}.dsmgr-selected[aria-selected=true]{background:var(--dsw-alias-interactive-bg-active)}
-.dsmgr-row[data-drop-target=true]{background:var(--dsw-alias-interactive-bg-hover-accent);box-shadow:inset 0 0 0 1px var(--dsw-alias-state-business-primary)}
+.dsmgr-row[data-drop-target=into]{background:var(--dsw-alias-interactive-bg-hover-accent);box-shadow:inset 0 0 0 1px var(--dsw-alias-state-business-primary)}.dsmgr-row[data-drop-target=before]{box-shadow:inset 0 2px 0 var(--dsw-alias-state-business-primary)}.dsmgr-row[data-drop-target=after]{box-shadow:inset 0 -2px 0 var(--dsw-alias-state-business-primary)}
 .dsmgr-chevron{display:none;color:var(--dsw-alias-label-caption)}.dsmgr-workspace:hover>.dsmgr-chevron{display:inline-flex}.dsmgr-workspace:hover>.dsmgr-workspace-folder{display:none}.dsmgr-arrow{transition:transform .15s var(--ds-ease-in-out)}.dsmgr-arrow-open{transform:rotate(90deg)}
 .dsmgr-hover{display:flex;flex-direction:column;gap:8px}.dsmgr-hover-title{color:#fff;overflow-wrap:break-word;font-size:14px;line-height:20px}.dsmgr-hover-time{color:#cfd3d6;font-size:12px;line-height:16px}
 .dsmgr-skeleton-row{box-sizing:border-box;display:flex;align-items:flex-start;gap:8px;min-height:48px;padding:6px 8px 7px}.dsmgr-skeleton-dot{flex:none;width:16px;height:16px;border-radius:50%}.dsmgr-skeleton-bars{display:flex;flex-direction:column;flex:1;gap:6px;min-width:0}.dsmgr-skeleton-dot,.dsmgr-skeleton-bar{background:var(--dsw-alias-bg-skeleton);animation:2s cubic-bezier(.36,0,.64,1) infinite dsmgr-pulse}.dsmgr-skeleton-bar{border-radius:var(--dsw-radius-xs);width:65%;height:16px}.dsmgr-skeleton-bar-wide{width:90%;height:13px}@keyframes dsmgr-pulse{50%{opacity:.4}}

@@ -69,7 +69,8 @@ function createStore(storage, key, onError) {
         let nextHistory = history;
         if (!same(before, after)) {
           if (drag) {
-            const inventory = value => value.parents.map(({ id, workspaceId }) => ({ id, workspaceId }));
+            // Reordering is a drag too, so compare the folder set, not its order.
+            const inventory = value => value.parents.map(({ id, workspaceId }) => id + '\0' + workspaceId).sort();
             if (!same(inventory(before), inventory(after))) {
               throw new Error('Drag updates may only change folder parents and session mappings');
             }
@@ -87,10 +88,11 @@ function createStore(storage, key, onError) {
         const previous = history[history.length - 1];
         if (!previous) return;
         if (!same(placement(state), previous.after)) throw new Error('Drag undo conflicts with current folder placement');
-        const parents = new Map(previous.before.parents.map(folder => [folder.id, folder.parentId]));
+        // placement matched previous.after, so before.parents lists exactly these folders, in their pre-drag order.
+        const byId = new Map(state.folders.map(folder => [folder.id, folder]));
         const next = snapshot({
           ...state,
-          folders: state.folders.map(folder => ({ ...folder, parentId: parents.get(folder.id) })),
+          folders: previous.before.parents.map(({ id, parentId }) => ({ ...byId.get(id), parentId })),
           sessionFolders: previous.before.sessionFolders,
         });
         persist(next, history.slice(0, -1));

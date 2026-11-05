@@ -9,11 +9,12 @@ const persistence = require('../storage.cjs');
 const KEY = 'dsh.session-manager.v1';
 const WORKSPACES = 'sidebar.workspaces';
 const MENU = WORKSPACES + '.session.menu.item';
+const ROW_ACTION = WORKSPACES + '.session.row.action';
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const event = options => ({
   ctrlKey: false, metaKey: false, shiftKey: false, detail: 1,
   stopPropagation() {}, preventDefault() {},
-  dataTransfer: { setData() {} }, ...options,
+  dataTransfer: { setData() {} }, clientY: 16, currentTarget: { getBoundingClientRect: () => ({ top: 0, height: 32 }) }, ...options,
 });
 
 // This harness runs hook state/effect lifetimes, not browser layout or React reconciliation.
@@ -116,7 +117,8 @@ function fixtureState() {
   return state;
 }
 
-function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compatible = true, mode = null } = {}) {
+function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compatible = true, mode = null,
+  legacyArchive = true, uiArchive = true } = {}) {
   const previousWindow = global.window;
   const previousError = console.error, previousWarn = console.warn;
   const errors = [], warnings = [], calls = [], effects = [], windowListeners = new Map();
@@ -155,7 +157,7 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
   const native = { options: { priority: 0 }, inject: () => ({ requestSessionRename: (...args) => calls.push(['rename', ...args]),
     requestSearch, hooks: { workspaceShortcuts: shortcuts.list } }) };
   const archive = { options: { id: 'archive' }, inject: () => ({ archiveSession: id => calls.push(['archive-native', id]) }) };
-  const entries = new Map([[WORKSPACES, compatible ? [native] : []], [MENU, [archive]]]);
+  const entries = new Map([[WORKSPACES, compatible ? [native] : []], [legacyArchive ? MENU : ROW_ACTION, [archive]]]);
   const subscriptions = new Map();
   const emit = key => { for (const listener of [...(subscriptions.get(key) || [])]) listener(); };
   const slots = {
@@ -177,8 +179,9 @@ function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compati
       };
     },
   };
-  const uiWorkspace = Object.fromEntries(['openSession', 'pinSession', 'unpinSession', 'archiveSession', 'unarchiveSession']
+  const uiWorkspace = Object.fromEntries(['openSession', 'pinSession', 'unpinSession', 'unarchiveSession']
     .map(name => [name, id => { calls.push([name, id]); }]));
+  if (uiArchive) uiWorkspace.archiveSession = id => { calls.push(['archiveSession', id]); };
   uiWorkspace.openWorkspace = async (workspaceId, beforeOpen) => {
     calls.push(['openWorkspace', workspaceId]); beforeOpen('created');
   };
@@ -315,15 +318,33 @@ test('factory declares dependencies and apply shadows native using options metad
 });
 
 test('incompatible native API retains original list and hot registration changes reconcile', t => {
-  const app = setup(t, { compatible: false });
+  const app = setup(t, { compatible: false, legacyArchive: false, uiArchive: false });
   assert.equal(app.entries.get(WORKSPACES).length, 0);
   app.entries.get(WORKSPACES).push(app.native); app.emit(WORKSPACES);
   assert.equal(app.entries.get(WORKSPACES).length, 2);
-  app.entries.set(MENU, []); app.emit(MENU);
+  app.entries.set(ROW_ACTION, []); app.emit(ROW_ACTION);
   assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
   assert.equal(app.warnings.length, 1);
-  app.entries.set(MENU, [app.archive]); app.emit(MENU);
+  app.entries.set(ROW_ACTION, [app.archive]); app.emit(ROW_ACTION);
   assert.equal(app.entries.get(WORKSPACES).length, 2);
+});
+
+// DSH 0.2.2 moved Archive out of the session menu into a row action and exposed it on uiWorkspace.
+test('a 0.2.2 shell without the legacy session menu still registers the tree', async t => {
+  const app = setup(t, { legacyArchive: false });
+  assert.equal(app.entries.get(WORKSPACES).length, 2);
+  const tree = app.render();
+  await app.click(button(row(tree, 'session:s1'), 'Archive'));
+  assert.deepEqual(app.calls.at(-1), ['archive-native', 's1']);
+});
+
+test('archive falls back to uiWorkspace when no slot entry injects it', async t => {
+  const app = setup(t, { legacyArchive: false, uiArchive: true });
+  app.entries.set(ROW_ACTION, []); app.emit(ROW_ACTION);
+  assert.equal(app.entries.get(WORKSPACES).length, 2);
+  const tree = app.render();
+  await app.click(button(row(tree, 'session:s1'), 'Archive'));
+  assert.deepEqual(app.calls.at(-1), ['archiveSession', 's1']);
 });
 
 test('corrupt persistence preserves native list and bytes without writing', t => {
@@ -1000,4 +1021,19 @@ test('tags: checklist toggles persist, rows show dots, header filter narrows the
   await app.click(row(tree, 'session:s1'));
   assert.deepEqual(saved(), { s1: ['todo'] });
   assert.deepEqual(app.calls.at(-1), ['openSession', 's1']);
+});
+
+test('dragging folders: row edges place before/after, a session row places after its parent level', t => {
+  const app = setup(t);
+  let tree = app.render();
+  row(tree, 'folder:b').props.onDragStart(event());
+  row(tree, 'folder:a').props.onDragOver(event({ clientY: 2, dataTransfer: {} }));
+  assert.equal(row(app.render(), 'folder:a').props['data-drop-target'], 'before');
+  row(app.render(), 'folder:a').props.onDrop(event({ clientY: 2 }));
+  assert.deepEqual(JSON.parse(app.storage.raw).folders.map(folder => folder.id), ['b', 'a']);
+  tree = app.render();
+  row(tree, 'folder:b').props.onDragStart(event());
+  row(tree, 'session:s1').props.onDrop(event());
+  assert.deepEqual(JSON.parse(app.storage.raw).folders.map(folder => folder.id), ['a', 'b']);
+  assert.equal(app.storage.writes, 2);
 });

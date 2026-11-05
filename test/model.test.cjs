@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  initialState, validateState, createFolder, renameFolder, setExpanded, moveItems,
+  initialState, validateState, createFolder, renameFolder, setExpanded, moveItems, placeItems,
   deleteFolder, folderSessionIds, rowsForWorkspace, pageRows, selectItems,
 } = require('../model.cjs');
 
@@ -317,4 +317,19 @@ test('pagination preserves folders and blanks, isolates nested limits and reveal
   assert.equal(result.filter(row => row.kind === 'session' && row.parentId === 'a').length, 8);
   assert.equal(result.filter(row => row.kind === 'session' && row.parentId === null && !row.blank).length, 7);
   assert.equal(result.at(-1).hidden, 2);
+});
+
+test('placeItems reorders sibling folders, keeps dragged relative order and moves across levels', () => {
+  let state = initialState();
+  for (const id of ['a', 'b', 'c']) state = createFolder(state, { id, workspaceId: 'w', name: id });
+  state = createFolder(state, { id: 'd', workspaceId: 'w', parentId: 'a', name: 'd' });
+  const roots = value => value.folders.filter(folder => folder.parentId === null).map(folder => folder.id);
+  assert.deepEqual(roots(placeItems(state, [folderItem('c')], { workspaceId: 'w', refId: 'a', after: false })), ['c', 'a', 'b']);
+  assert.deepEqual(roots(placeItems(state, [folderItem('c'), folderItem('a')], { workspaceId: 'w', refId: 'b' })), ['b', 'a', 'c']);
+  const lifted = placeItems(state, [folderItem('d')], { workspaceId: 'w', refId: 'b' });
+  assert.deepEqual(roots(lifted), ['a', 'b', 'd', 'c']);
+  assert.deepEqual(roots(placeItems(state, [folderItem('a')], { workspaceId: 'w', refId: null })), ['b', 'c', 'a']);
+  assert.equal(placeItems(state, [folderItem('a')], { workspaceId: 'w', refId: 'a' }), state);
+  assert.throws(() => placeItems(state, [folderItem('a')], { workspaceId: 'w', refId: 'd' }), /into itself/);
+  assert.throws(() => placeItems(state, [folderItem('a')], { workspaceId: 'x', refId: 'b' }), /across workspaces/);
 });

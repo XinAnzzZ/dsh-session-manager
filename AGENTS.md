@@ -42,6 +42,7 @@ npm pack --dry-run --json --ignore-scripts
 
 - 以 `priority: -10` 注册 `sidebar.workspaces` slot 覆盖原生列表；关闭「使用树状列表」或探测失败时注销，原生列表自动恢复。
 - `discover()` 从原生 slot 的 `inject()` 取重命名、归档回调。这不是公开 API（源码里标了 `shortcut:`），DSH 升级后先确认它还能拿到；拿不到必须退回原生列表，不能半残地渲染。
+  - 0.2.2 起内置归档不再是 `sidebar.workspaces.session.menu.item` 的 slot 条目，改为 `ctx.uiWorkspace.archiveSession` + `sidebar.workspaces.session.row.action` 里的悬停按钮。`discover()` 按「row.action → menu.item → `uiWorkspace.archiveSession`」顺序取，并对这两个 slot 都订阅 reconcile。
 - 打开、新建、重命名、归档、恢复、置顶会话一律走原生接口，插件不自己改会话数据。
 
 ## 约束
