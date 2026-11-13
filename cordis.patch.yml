@@ -1,4 +1,4 @@
 - insert:
     - id: dsh-session-manager
-      name: dsh-session-manager
+      name: '@yuxhangz/dsh-session-manager'
       config: {}

@@ -9,7 +9,7 @@ const root = path.join(__dirname, '..');
 
 test('manifest exports real runtime, localized metadata, icon and unique bundle row', async () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-  assert.equal(manifest.name, 'dsh-session-manager');
+  assert.equal(manifest.name, '@yuxhangz/dsh-session-manager');
   assert.equal(manifest.dsh.client.platform, 'web');
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-workspace'));
   for (const key of ['.', './client', './package.json', './icon']) {
@@ -21,8 +21,9 @@ test('manifest exports real runtime, localized metadata, icon and unique bundle 
     assert.ok(locale.meta.description.length > 20);
   }
   const patch = fs.readFileSync(path.join(root, manifest.dsh.bundle.patch), 'utf8');
+  // The row id addresses the host half; the name must be the full package name.
   assert.match(patch, /id: dsh-session-manager/);
-  assert.match(patch, /name: dsh-session-manager/);
+  assert.match(patch, /name: '@yuxhangz\/dsh-session-manager'/);
   const icon = fs.readFileSync(path.join(root, manifest.exports['./icon']), 'utf8');
   assert.match(icon, /^<svg[^>]+xmlns="http:\/\/www.w3.org\/2000\/svg"/);
   assert.match(icon, /<\/svg>/);
@@ -36,7 +37,7 @@ test('built artifact registers a lazy plugin and reuses host React and native UI
   const context = vm.createContext({ window: { __ModuleLoader__: { load(value) { entry = value; } } } });
   const artifact = fs.readFileSync(path.join(root, 'client.js'), 'utf8');
   vm.runInContext(artifact, context);
-  assert.equal(entry.id, 'dsh-session-manager');
+  assert.equal(entry.id, '@yuxhangz/dsh-session-manager');
   const imports = [];
   const plugin = entry.factory((id) => {
     imports.push(id);
