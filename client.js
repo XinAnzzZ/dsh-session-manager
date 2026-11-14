@@ -622,18 +622,21 @@ module.exports = function createPlugin(React, model, persistence, ui) {
   function FolderIcon({ depth, open = true }) {
     return h('span', { className: 'dsmgr-folder-icon', 'data-tone': depth === undefined ? undefined : depth % 3 }, icon(open ? 'FolderOpen' : 'FolderClose'));
   }
-  // point: viewport coordinates of a right-click; the menu then opens at the cursor instead of under the button.
+  // point: client-viewport coordinates of a right-click; the menu then opens at the cursor instead of under the button.
+  // A point-anchored menu is anchored on the point itself, so the trigger button stays in the row.
   function Actions({ label, items, disabled = false, point = null, onPointClose }) {
     const [open, setOpen] = React.useState(false);
     const shown = open || point !== null;
     const close = () => { setOpen(false); onPointClose?.(); };
-    return h(ui.Menu, { open: shown, onClose: close, portal: true, align: point ? 'start' : 'end',
-      getAnchorRect: point ? () => ({ left: point.x, right: point.x, top: point.y, bottom: point.y }) : undefined,
+    const menu = (anchor, key) => h(ui.Menu, { key, open: shown, onClose: close, portal: true, align: point ? 'start' : 'end',
+      anchorPoint: point ? { x: point.x, y: point.y } : undefined, anchor,
       items: items.map((item) => ({ ...item, disabled: disabled || item.disabled })),
-      onSelect: (id) => { close(); items.find((item) => item.id === id)?.action(); },
-      anchor: h('button', { type: 'button', className: 'dsmgr-icon-button', title: label, 'aria-label': label,
-        'aria-haspopup': 'menu', 'aria-expanded': shown, disabled,
-        onClick: (event) => { event.stopPropagation(); if (point) close(); else setOpen(!open); } }, icon('EllipsisOutline')) });
+      onSelect: (id) => { close(); items.find((item) => item.id === id)?.action(); } });
+    const trigger = (onClick, key) => h('button', { key, type: 'button', className: 'dsmgr-icon-button', title: label, 'aria-label': label,
+      'aria-haspopup': 'menu', 'aria-expanded': shown, disabled, onClick: (event) => { event.stopPropagation(); onClick(); } }, icon('EllipsisOutline'));
+    return point
+      ? [trigger(close, 'trigger'), menu(null, 'menu')]
+      : menu(trigger(() => setOpen(!open)), 'menu');
   }
   // One activity count. A single session opens directly; several open a native menu of them.
   function ActivityCount({ kind, count, label, stats, entries, onOpen }) {
@@ -717,9 +720,10 @@ module.exports = function createPlugin(React, model, persistence, ui) {
   const tagLabel = (tag, count) => h('span', { className: 'dsmgr-tag-item' }, tagDot(tag), tag.name,
     count !== undefined && h('span', { className: 'dsmgr-tag-count' }, count));
   // Checklist of every tag for the target sessions; stays open so several tags can be toggled in one go.
-  function TagMenu({ tags, ids, rect, t, onToggle, onNew, onClose }) {
+  // point: client-viewport coordinates (event.clientX/clientY or a row rect), the native Menu anchor for pointer gestures.
+  function TagMenu({ tags, ids, point, t, onToggle, onNew, onClose }) {
     const all = tags.tags.filter((tag) => ids.every((id) => tags.sessions[id]?.includes(tag.id))).map((tag) => tag.id);
-    return h(ui.Menu, { open: true, portal: true, align: 'start', anchor: null, getAnchorRect: () => rect, onClose,
+    return h(ui.Menu, { open: true, portal: true, align: 'start', anchor: null, anchorPoint: point, onClose,
       selectedIds: all, selection: 'check',
       items: [...tags.tags.map((tag) => ({ id: tag.id, label: tagLabel(tag) })), ...(tags.tags.length ? [{ type: 'separator' }] : []),
         { id: NEW_TAG, label: t('newTag'), icon: icon('PlusOutline') }],
@@ -970,9 +974,10 @@ module.exports = function createPlugin(React, model, persistence, ui) {
         function openTags(row, point) {
           const key = keyOf(row);
           const ids = chosen.size > 1 && chosen.has(key) ? [...chosen].filter((item) => item.startsWith('session:')).map((item) => item.slice(8)) : [row.id];
-          const r = point ? { left: point.x, right: point.x, top: point.y, bottom: point.y }
-            : rootRef.current?.querySelector('[data-dsm-key=' + JSON.stringify(key) + ']')?.getBoundingClientRect() ?? null;
-          setTagMenu({ ids, rect: r ? { left: r.left, right: r.right, top: r.top, bottom: r.bottom } : { left: 0, right: 0, top: 0, bottom: 0 } });
+          const r = point ? null : rootRef.current?.querySelector('[data-dsm-key=' + JSON.stringify(key) + ']')?.getBoundingClientRect() ?? null;
+          // A point anchor is client-viewport coordinates; open under the row when the menu came from the row's own button.
+          const anchor = point ? { x: point.x, y: point.y } : r && { x: r.left, y: r.bottom };
+          setTagMenu({ ids, point: anchor ?? { x: 0, y: 0 } });
         }
         // Another shell changed the folders (conflict or refresh), or a write failed and the store reverts to the host copy.
         React.useEffect(() => storage.subscribe((key, failure) => {
@@ -1190,7 +1195,7 @@ module.exports = function createPlugin(React, model, persistence, ui) {
               open && group.rows.map(rowView), open && group.rows.length === 0 && h('p', { className: 'dsmgr-hint' }, t('empty')));
             })),
           toast && h(ui.Toast, { key: toast.id, text: toast.text, onDone: () => setToast((current) => current?.id === toast.id ? null : current) }),
-          tagMenu && h(TagMenu, { tags, ids: tagMenu.ids, rect: tagMenu.rect, t, onClose: () => setTagMenu(null),
+          tagMenu && h(TagMenu, { tags, ids: tagMenu.ids, point: tagMenu.point, t, onClose: () => setTagMenu(null),
             onToggle: (tagId, on) => editTags((previous) => model.setSessionTag(previous, tagMenu.ids, tagId, on)),
             onNew: () => { setTagMenu(null); setDialog({ type: 'tag', ids: tagMenu.ids }); } }),
           dialog && (dialog.type === 'tag' ? h(TagDialog, { key: 'tag', title: t('newTagTitle'), t, onClose: () => setDialog(null),

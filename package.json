@@ -1,6 +1,6 @@
 {
   "name": "@yuxhangz/dsh-session-manager",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "type": "module",
   "description": "Nested session folders in the DSH sidebar: folders, tags, and activity counts you can click to jump.",
   "keywords": ["deepseek-harness", "dsh", "dsh-plugin", "sessions", "folders", "sidebar", "tags"],

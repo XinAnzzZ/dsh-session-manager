@@ -896,18 +896,18 @@ test('right-clicking a folder opens its menu at the cursor; sessions open the ta
   assert.equal(prevented, true);
   let menu = nodes(row(app.render(), 'folder:a'), node => node.type === 'native-menu')[0];
   assert.equal(menu.props.open, true);
-  assert.deepEqual(menu.props.getAnchorRect(), { left: 40, right: 40, top: 90, bottom: 90 });
+  assert.deepEqual(menu.props.anchorPoint, { x: 40, y: 90 });
   menu.props.onClose();
   menu = nodes(row(app.render(), 'folder:a'), node => node.type === 'native-menu')[0];
   assert.equal(menu.props.open, false);
-  assert.equal(menu.props.getAnchorRect, undefined);
+  assert.equal(menu.props.anchorPoint, undefined);
   let draftPrevented = false;
   row(app.tree, 'session:blank').props.onContextMenu(event({ preventDefault() { draftPrevented = true; } }));
   assert.equal(draftPrevented, false);
   row(app.tree, 'session:s1').props.onContextMenu(event({ clientX: 10, clientY: 20, preventDefault() {} }));
   const tagMenu = nodes(app.render(), node => node.type === 'native-menu' && node.props.items.some(item => item.id === '\0new-tag'))[0];
   assert.ok(tagMenu, 'Expected tag checklist');
-  assert.deepEqual(tagMenu.props.getAnchorRect(), { left: 10, right: 10, top: 20, bottom: 20 });
+  assert.deepEqual(tagMenu.props.anchorPoint, { x: 10, y: 20 });
 });
 
 test('session rows have a quick archive button; archived rows get quick restore; drafts get neither', async t => {

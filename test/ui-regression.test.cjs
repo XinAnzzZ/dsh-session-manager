@@ -35,6 +35,11 @@ test('hover actions replace time and pin; size containment stays on summary rows
   assert.doesNotMatch(source, /\.dsmgr\{[^}]*container-type:/);
   assert.match(source, /\.dsmgr-row\[data-kind=folder\],\.dsmgr-workspace\{width:100%;container-type:inline-size\}\.dsmgr header\{container-type:inline-size\}/);
 });
+test('menus anchor with anchorPoint/anchor: getAnchorRect was removed in DSH rc.3 and is silently ignored', () => {
+  assert.doesNotMatch(source, /getAnchorRect/);
+  assert.match(source, /anchorPoint: point \? \{ x: point\.x, y: point\.y \} : undefined, anchor,/);
+  assert.match(source, /anchor: null, anchorPoint: point/);
+});
 test('settings owns native mode switch without footer registration; modal uses native primitives', () => {
   assert.match(source, /ctx.slots.inject\('settings.section'/);
   assert.match(source, /h\(ui.Switch, \{ checked: !native/);
