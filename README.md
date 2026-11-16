@@ -4,6 +4,10 @@ DSH 侧栏插件：在工作区里用嵌套文件夹整理会话。
 
 文件夹只是界面上的分组，数据存在本机 DSH 的 host 端。会话本身、DSH 安装目录、工作区成员关系都不会被修改；关闭插件后回到原生列表，分组数据保留。
 
+![侧栏](assets/sidebar.png)
+
+![操作演示](assets/demo.gif)
+
 ## 功能
 
 - **文件夹**：工作区下可建任意层级的文件夹。单击展开/折叠，双击或 F2 重命名，右键打开操作菜单。图标按层级循环三种颜色，可在设置 → 会话管理中自定义。
@@ -28,15 +32,17 @@ DSH 侧栏插件：在工作区里用嵌套文件夹整理会话。
 dsh plugin add @yuxhangz/dsh-session-manager
 ```
 
-也可以在 Desktop 左侧「插件」→「安装第三方插件」里填包名。从源码开发时，改成填仓库根目录（`package.json` 所在目录）的本地路径；本地目录安装会链接到源码目录，启用期间不要移动或删除它。
+也可以在 Desktop 左侧「插件」→「安装第三方插件」里填完整包名 `@yuxhangz/dsh-session-manager`。**不要只填 `dsh-session-manager`**：npm 和插件市场里已有多个人用这个裸名，只会装到别人的插件。市场里搜 `yuxhangz` 或 `@yuxhangz/dsh-session-manager` 能找到本插件；确认是这份时，作者是 `XinAnzzZ`，仓库是 <https://github.com/XinAnzzZ/dsh-session-manager>。
 
-更新：`dsh plugin update @yuxhangz/dsh-session-manager`，或重装一次。从源码开发改完代码后先运行 `node build.cjs`，再**完全退出 Desktop（包括托盘）并重启**，否则会继续使用旧模块。
+从源码开发时，改成填仓库根目录（`package.json` 所在目录）的本地路径；本地目录安装会链接到源码目录，启用期间不要移动或删除它。
+
+更新：`dsh plugin update @yuxhangz/dsh-session-manager`，或重装一次。从源码开发改完代码后先运行 `node build.cjs`：前端改动会被客户端热重载，**改了 host 部分（`index.js`）或插件清单才需要完全退出 Desktop（包括托盘）并重启**。
 
 想临时回到原生列表：设置 →「会话管理」→ 关闭「使用树状列表」。分组数据保留，可随时切回。
 
 ## 数据
 
-数据存在 DSH host 端的 `~/.dsh/session-manager/storage.json`（设置了 `DSH_HOME` 时在其下），本机所有连到这个 DSH 的窗口（DSH Desktop、DeepSeek Harness、浏览器）共用同一份：
+数据存在 DSH host 端的 `~/.dsh/session-manager/storage.json`（Windows 上是 `C:\Users\<你>\.dsh\session-manager\storage.json`；设置了 `DSH_HOME` 时在该目录下），本机所有连到这个 DSH 的窗口（DSH Desktop、DeepSeek Harness、浏览器）共用同一份：
 
 | 键 | 内容 |
 | --- | --- |
